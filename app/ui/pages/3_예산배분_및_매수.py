@@ -1,0 +1,294 @@
+"""
+3_예산배분_및_매수.py
+
+예산 배분 후 수동 매수 또는 9:20 일괄매수를 실행합니다.
+"""
+import streamlit as st
+import pandas as pd
+from datetime import datetime
+
+try:
+    from app.trading.budget_allocator import BudgetAllocator
+    from app.trading.broker_factory import create_broker
+    from app.trading.order_manager import OrderManager
+    from app.strategy.top15_selector import Top15Selector
+    from app.config import get_config
+    from app.utils.stock_utils import format_amount, format_price
+except Exception as e:
+    st.error(f"모듈 로드 오류: {e}")
+
+st.title("예산 배분 및 매수")
+
+# ---------------------------------------------------------------------------
+# Section 1 — 계좌 모드 및 예산 설정
+# ---------------------------------------------------------------------------
+st.subheader("계좌 모드 및 예산")
+
+col_mode, col_budget, col_shares = st.columns(3)
+
+with col_mode:
+    selected_mode = st.selectbox(
+        "계좌 모드",
+        options=["dry_run", "mock", "real"],
+        index=0,
+        help="dry_run: 가상 | mock: KIS 모의투자 | real: KIS 실전투자",
+    )
+
+with col_budget:
+    total_budget = st.number_input(
+        "총 예산 (원)",
+        min_value=100_000,
+        max_value=100_000_000,
+        value=10_000_000,
+        step=100_000,
+        format="%d",
+    )
+
+with col_shares:
+    max_shares = st.number_input(
+        "종목당 최대 수량",
+        min_value=1,
+        max_value=10,
+        value=2,
+    )
+
+if selected_mode == "dry_run":
+    st.info("드라이런 모드: 실제 주문 없이 가상 매수가 실행됩니다.")
+elif selected_mode == "mock":
+    st.warning("모의투자 모드: KIS 모의투자 계좌에 주문됩니다. (실제 돈 아님)")
+elif selected_mode == "real":
+    st.error("실전투자 모드: 실제 KIS 계좌에 주문됩니다. 신중하게 확인하세요!")
+
+# 실전투자 확인 문구
+confirm_text = ""
+if selected_mode == "real":
+    try:
+        cfg_tmp = get_config()
+        expected_text = cfg_tmp.real_confirm_text()
+    except Exception:
+        expected_text = "I_UNDERSTAND_REAL_TRADING_RISK"
+    confirm_text = st.text_input(
+        f"실전투자 확인 문구 입력 ('{expected_text}')",
+        type="password",
+        placeholder=expected_text,
+    )
+    if confirm_text and confirm_text != expected_text:
+        st.error("확인 문구가 틀립니다. 매수 버튼이 비활성화됩니다.")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Section 2 — Top 15 불러오기
+# ---------------------------------------------------------------------------
+st.subheader("Top 15 불러오기")
+
+col_load1, col_load2 = st.columns([1, 3])
+with col_load1:
+    if st.button("Top 15 불러오기", use_container_width=True):
+        top15 = st.session_state.get("top15") or []
+        if not top15:
+            try:
+                selector = Top15Selector()
+                top15 = selector.load_top15()
+            except Exception as e:
+                st.error(f"Top 15 로드 오류: {e}")
+        if top15:
+            st.session_state["top15"] = top15
+            st.success(f"Top 15 종목 {len(top15)}개 로드 완료")
+        else:
+            st.warning("Top 15 종목이 없습니다. 2단계(Top15 선정)를 먼저 실행하세요.")
+
+top15 = st.session_state.get("top15", [])
+if top15:
+    rows = [
+        {
+            "순위": c.rank,
+            "종목코드": c.symbol,
+            "종목명": c.name,
+            "현재가": format_price(c.current_price),
+            "갭률(%)": f"{c.gap_rate:.2f}",
+            "최종점수": f"{c.final_score:.4f}",
+        }
+        for c in top15
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Section 3 — 예산 배분
+# ---------------------------------------------------------------------------
+st.subheader("예산 배분")
+
+col_alloc1, col_alloc2 = st.columns([1, 3])
+with col_alloc1:
+    if st.button("예산 배분 계산", use_container_width=True):
+        if not top15:
+            st.warning("먼저 Top 15 종목을 불러오세요.")
+        else:
+            try:
+                allocator = BudgetAllocator()
+                buy_plan = allocator.allocate(
+                    top15,
+                    total_budget=float(total_budget),
+                    max_shares=int(max_shares),
+                )
+                st.session_state["buy_plan"] = buy_plan
+                st.success(f"배분 완료: {len(buy_plan)}개 종목")
+            except Exception as e:
+                st.error(f"예산 배분 오류: {e}")
+
+buy_plan = st.session_state.get("buy_plan", [])
+if buy_plan:
+    rows = [
+        {
+            "순위": p.rank,
+            "종목코드": p.symbol,
+            "종목명": p.name,
+            "현재가": format_price(p.current_price),
+            "배분수량": p.allocated_quantity,
+            "배분금액": format_amount(p.allocated_amount),
+        }
+        for p in buy_plan
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    total_invested = sum(p.allocated_amount for p in buy_plan)
+    remaining = float(total_budget) - total_invested
+    m1, m2, m3 = st.columns(3)
+    m1.metric("배분 종목", f"{len(buy_plan)}개")
+    m2.metric("총 투자금", format_amount(total_invested))
+    m3.metric("잔여 예산", format_amount(remaining))
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Section 4 — 매수 유형 선택 및 실행
+# ---------------------------------------------------------------------------
+st.subheader("매수 실행")
+
+buy_type = st.radio(
+    "매수 유형",
+    options=["수동 매수", "9:20 일괄매수 (예약)"],
+    horizontal=True,
+    help="수동: 버튼 클릭 즉시 실행 | 9:20 예약: 9시 20분에 실행 가능 (직접 클릭 필요)",
+)
+
+has_plan = bool(buy_plan)
+real_confirm_ok = (
+    selected_mode != "real"
+    or (confirm_text and confirm_text == (
+        get_config().real_confirm_text() if get_config else "I_UNDERSTAND_REAL_TRADING_RISK"
+    ))
+)
+
+# ── 수동 매수 ──────────────────────────────────────────────────────────────
+if buy_type == "수동 매수":
+    buy_disabled = not has_plan or not real_confirm_ok
+    if st.button(
+        "지금 매수 실행",
+        disabled=buy_disabled,
+        type="primary",
+        use_container_width=True,
+    ):
+        _execute_buy = True
+    else:
+        _execute_buy = False
+
+    if not has_plan:
+        st.caption("먼저 예산 배분 계산을 실행하세요.")
+    elif buy_disabled and selected_mode == "real":
+        st.caption("실전투자 확인 문구를 입력해야 활성화됩니다.")
+
+# ── 9:20 일괄매수 예약 ────────────────────────────────────────────────────
+else:
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    is_920 = (h == 9 and 18 <= m <= 22)  # 9:18~9:22 허용 범위
+
+    st.markdown(f"**현재 시각**: {now.strftime('%H:%M:%S')}")
+
+    if is_920:
+        st.success("9:20 매수 시간입니다! 아래 버튼을 눌러 매수를 실행하세요.")
+    else:
+        target = "09:20"
+        st.info(f"9:20 일괄매수 예약 중 — 목표 시각: {target}. 시간이 되면 버튼이 활성화됩니다.")
+
+    buy_disabled = not has_plan or not is_920 or not real_confirm_ok
+    if st.button(
+        f"9:20 일괄매수 실행",
+        disabled=buy_disabled,
+        type="primary",
+        use_container_width=True,
+    ):
+        _execute_buy = True
+    else:
+        _execute_buy = False
+
+    if not is_920:
+        st.caption(f"현재 {now.strftime('%H:%M')} — 9:18~9:22 사이에만 버튼이 활성화됩니다.")
+
+# ── 공통 매수 실행 로직 ───────────────────────────────────────────────────
+if _execute_buy:
+    try:
+        cfg = get_config()
+        with st.spinner("브로커 초기화 중..."):
+            broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text)
+        order_manager = OrderManager(broker=broker, cfg=cfg)
+
+        with st.spinner("매수 주문 실행 중..."):
+            results = order_manager.execute_buy_plans(buy_plan)
+
+        st.session_state["buy_results"] = results
+
+        try:
+            log_path = order_manager.save_order_log(results)
+            st.caption(f"주문 로그: {log_path}")
+        except Exception as log_err:
+            st.warning(f"로그 저장 오류: {log_err}")
+
+        result_rows = [
+            {
+                "종목코드": r.symbol,
+                "종목명": r.name,
+                "수량": r.quantity,
+                "가격": format_price(r.price),
+                "주문번호": r.order_id,
+                "결과": "성공" if r.success else "실패",
+                "메시지": r.message,
+            }
+            for r in results
+        ]
+        if result_rows:
+            def _hl(row):
+                color = "#d4edda" if "성공" in str(row["결과"]) else "#f8d7da"
+                return [f"background-color:{color}"] * len(row)
+            df_res = pd.DataFrame(result_rows)
+            st.dataframe(df_res.style.apply(_hl, axis=1), use_container_width=True, hide_index=True)
+
+        success_count = sum(1 for r in results if r.success)
+        fail_count = len(results) - success_count
+        rc1, rc2 = st.columns(2)
+        rc1.metric("매수 성공", success_count)
+        rc2.metric("매수 실패", fail_count)
+
+        if results and all(r.success for r in results):
+            st.balloons()
+            st.success("모든 매수 주문 완료!")
+        elif success_count > 0:
+            st.warning(f"{success_count}개 성공 / {fail_count}개 실패")
+        else:
+            st.error("모든 매수 주문이 실패했습니다.")
+
+    except RuntimeError as e:
+        st.error(f"매수 실행 오류 (안전장치 차단): {e}")
+    except Exception as e:
+        st.error(f"예상치 못한 오류: {e}")
+
+# 이전 결과 표시
+if st.session_state.get("buy_results") and not _execute_buy:
+    prev_results = st.session_state["buy_results"]
+    success_count = sum(1 for r in prev_results if r.success)
+    st.info(f"이전 매수 결과: {success_count}/{len(prev_results)}건 성공")
+    if st.button("→ 보유종목으로 이동"):
+        st.switch_page("pages/4_보유종목_및_일괄매도.py")

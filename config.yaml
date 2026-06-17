@@ -1,0 +1,93 @@
+mode: "mock"  # dry_run | mock | real
+
+trading:
+  total_budget: 10000000
+  max_positions: 15
+  max_shares_per_stock: 2
+  min_gap_rate: 3.0
+  max_gap_rate: 15.0
+  min_trade_value: 3000000000
+  buy_start_time: "09:05"
+  buy_end_time: "09:10"
+  first_take_profit_rate: 3.0
+  second_take_profit_rate: 5.0
+  stop_loss_rate: -1.5
+  force_sell_time: "13:00"
+  emergency_sell_time: "15:10"
+  order_type: "limit"
+  allow_market_order: false
+  min_price: 1000
+
+filters:
+  exclude_etf: true
+  exclude_etn: true
+  exclude_preferred_stock: true
+  exclude_spac: true
+  exclude_reit: true
+  exclude_warning_stock: true
+  exclude_halt: true
+  min_price: 1000
+  max_spread_rate: 1.0
+
+data_source:
+  pre_market_primary: "naver"
+  regular_market_primary: "kis"
+  secondary: "naver"
+  use_naver_gap_tab: true
+  use_naver_volume_tab: true
+  refresh_before_market_open: true
+  refresh_after_market_open: true
+  market_open_time: "09:00"
+
+naver:
+  sise_url: "https://finance.naver.com/sise/"
+
+kis:
+  mock:
+    app_key_env: "KIS_MOCK_APP_KEY"
+    app_secret_env: "KIS_MOCK_APP_SECRET"
+    account_no_env: "KIS_MOCK_ACCOUNT_NO"
+    product_code_env: "KIS_MOCK_ACCOUNT_PRODUCT_CODE"
+    base_url: "https://openapivts.koreainvestment.com:29443"
+    enabled: true
+
+  real:
+    app_key_env: "KIS_REAL_APP_KEY"
+    app_secret_env: "KIS_REAL_APP_SECRET"
+    account_no_env: "KIS_ACCOUNT_NO"
+    product_code_env: "KIS_ACCOUNT_PRODUCT_CODE"
+    base_url: "https://openapi.koreainvestment.com:9443"
+    enabled: false
+
+dart:
+  enabled: true
+  api_key_env: "DART_API_KEY"
+  lookback_days: 7
+  use_disclosure_score: true
+  disclosure_score_weight: 0.10
+  max_positive_bonus: 10
+  max_negative_penalty: -20
+  exclude_severe_risk_disclosure: true
+
+ml:
+  use_model: true
+  fallback_to_rule_score: true
+  model_path: "models/gap_model.pkl"
+  feature_importance_path: "models/feature_importance.csv"
+  min_training_rows: 500
+  ml_weight: 0.6
+  rule_weight: 0.4
+
+safety:
+  enable_real_trading: false
+  require_real_confirm: true
+  real_confirm_text: "I_UNDERSTAND_REAL_TRADING_RISK"
+  max_real_order_amount: 1000000
+  max_real_daily_budget: 1000000
+  max_daily_loss_rate: -5.0
+
+logging:
+  save_csv: true
+  save_db: false
+  level: "INFO"
+  log_dir: "logs"
