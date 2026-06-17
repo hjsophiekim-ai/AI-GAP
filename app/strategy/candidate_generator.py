@@ -15,6 +15,7 @@ from app.models import StockData, Candidate, StockFeatures
 from app.strategy.filters import StockFilter
 from app.strategy.scoring import Scorer
 from app.features.feature_builder import FeatureBuilder
+from app.strategy.candidate_quality_filter import CandidateQualityFilter
 from app.config import get_config
 from app.logger import logger
 
@@ -27,6 +28,7 @@ class CandidateGenerator:
         self._filter = StockFilter(cfg=self.cfg)
         self._scorer = Scorer(cfg=self.cfg)
         self._feature_builder = FeatureBuilder()
+        self._quality_filter = CandidateQualityFilter(cfg=self.cfg)
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -36,6 +38,7 @@ class CandidateGenerator:
         self,
         stocks: list[StockData],
         predictions: list[dict] = None,
+        daily_prices_cache: dict[str, list[dict]] = None,
     ) -> list[Candidate]:
         """
         Main pipeline:
@@ -44,7 +47,8 @@ class CandidateGenerator:
           3. Run Scorer
           4. Merge ML predictions if available
           5. Sort by final_score descending
-          6. Return top 50 as list[Candidate]
+          6. Apply CandidateQualityFilter (bonus/penalty + theme cap)
+          7. Return top 50 as list[Candidate]
         """
         total_in = len(stocks)
 
@@ -132,6 +136,22 @@ class CandidateGenerator:
         logger.info(
             f"총 {total_in}개 종목 수집 → 필터링 후 {filtered_count}개 → 후보 {len(candidates)}개 선정"
         )
+
+        # Step 6: Quality filter (bonus/penalty + theme cap)
+        # Build {symbol: StockData} for flag access in QualityFilter
+        stock_data_by_symbol: dict[str, StockData] = {s.symbol: s for s in passed}
+        try:
+            candidates, excluded_q = self._quality_filter.filter_and_score(
+                candidates,
+                stock_data_by_symbol=stock_data_by_symbol,
+                daily_prices_cache=daily_prices_cache or {},
+            )
+            if excluded_q:
+                logger.info(f"[QFilter] 품질필터 추가 제외: {len(excluded_q)}개")
+                for item in excluded_q:
+                    logger.debug(f"  [QFilter제외] {item.get('code')} {item.get('name')} - {item.get('excluded_reason')}")
+        except Exception as e:
+            logger.warning(f"[QFilter] 품질필터 오류 (건너뜀): {e}")
 
         return candidates
 

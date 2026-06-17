@@ -1,6 +1,7 @@
 from app.models import Candidate
 from app.config import get_config
 from app.logger import logger
+from app.strategy.candidate_quality_filter import CandidateQualityFilter
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
@@ -85,6 +86,25 @@ class Top15Selector:
         df = pd.read_csv(path, dtype={"symbol": str})
         candidates = self._df_to_candidates(df)
         return self.select(candidates)
+
+    def save_explain(
+        self,
+        candidates: list[Candidate],
+        excluded: list[dict] = None,
+        date_str: str = None,
+        time_str: str = None,
+    ) -> tuple[str, str]:
+        """
+        top15_explain_YYYYMMDD_HHMM.csv 와 excluded_candidates_YYYYMMDD_HHMM.csv 저장.
+        CandidateQualityFilter.save_explain_csv를 위임.
+        """
+        qf = CandidateQualityFilter(cfg=self.cfg)
+        return qf.save_explain_csv(
+            candidates,
+            excluded=excluded or [],
+            date_str=date_str,
+            time_str=time_str,
+        )
 
     def save_top15(self, candidates: list[Candidate], date_str: str = None) -> str:
         """

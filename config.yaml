@@ -91,3 +91,21 @@ logging:
   save_db: false
   level: "INFO"
   log_dir: "logs"
+
+candidate_quality_filters:
+  enabled: true
+  speed_mode: true                      # true: 무거운 필터는 상위 N개에만 적용
+  max_candidates_for_heavy_filters: 30  # MA/수익률 필터 적용 상한
+  # 빠른 제외 필터
+  min_price: 1000                       # 최저 현재가 (원)
+  min_trading_value_0920: 3000000000    # 09:20 기준 최소 거래대금 (30억)
+  max_open_gap_rate: 12.0               # 최대 허용 갭상승률 (%)
+  caution_gap_rate: 7.0                 # 이 이상이면 감점 구간 시작 (%)
+  # 과열/급락 필터 (일봉 데이터 필요)
+  max_3d_return: 25.0                   # 최근 3일 최대 수익률 (% 초과시 감점)
+  max_5d_return: 35.0                   # 최근 5일 최대 수익률 (% 초과시 감점)
+  # 장초반 리스크
+  max_intraday_drop_from_high: 4.0      # 장초반 고점 대비 허용 낙폭 (%)
+  max_ma20_extension_rate: 15.0         # MA20 대비 최대 허용 초과폭 (%)
+  # 테마 집중 제한
+  max_same_theme_in_top15: 4            # 동일 테마 최대 허용 종목 수

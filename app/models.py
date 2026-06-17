@@ -112,6 +112,17 @@ class Candidate:
     selected_reason: str = ""
     risk_comment: str = ""
     exclude_reason: str = ""
+    # Quality filter fields (populated by CandidateQualityFilter)
+    theme: str = ""
+    matched_themes: str = ""
+    quality_bonus: float = 0.0
+    momentum_bonus: float = 0.0
+    ma_bonus: float = 0.0
+    theme_leader_bonus: float = 0.0
+    risk_penalty_q: float = 0.0
+    liquidity_penalty: float = 0.0
+    overheat_penalty: float = 0.0
+    warning_reason: str = ""
 
 
 @dataclass
