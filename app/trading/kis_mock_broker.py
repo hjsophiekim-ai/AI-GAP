@@ -46,24 +46,24 @@ class KisMockBroker(BrokerBase):
             return 0.0
 
     def get_positions(self) -> list[Position]:
-        try:
-            result = self.kis.get_balance()
-            positions = []
-            for item in result.get("positions", []):
-                positions.append(
-                    Position(
-                        symbol=item["symbol"],
-                        name=item["name"],
-                        quantity=item["quantity"],
-                        avg_price=item["avg_price"],
-                        current_price=item["current_price"],
-                    )
+        result = self.kis.get_balance()
+        if "error" in result:
+            err = result["error"]
+            logger.error("MOCK get_positions 잔고 조회 오류: %s", err)
+            raise RuntimeError(f"KIS 모의계좌 잔고 조회 실패: {err}")
+        positions = []
+        for item in (result.get("positions") or []):
+            positions.append(
+                Position(
+                    symbol=item["symbol"],
+                    name=item["name"],
+                    quantity=item["quantity"],
+                    avg_price=item["avg_price"],
+                    current_price=item["current_price"],
                 )
-            logger.info("MOCK get_positions: %d 종목", len(positions))
-            return positions
-        except Exception as e:
-            logger.error("MOCK get_positions 예외: %s", e)
-            return []
+            )
+        logger.info("MOCK get_positions: %d 종목", len(positions))
+        return positions
 
     def buy(
         self,

@@ -1,16 +1,18 @@
 """
 KisRealBroker - KIS 실전투자 계좌 브로커.
 
-SAFETY: 주문 전 6가지 안전 조건을 모두 통과해야 합니다.
+SAFETY: 6가지 안전 조건.
   1. mode == "real"
   2. config.yaml kis.real.enabled == true
   3. config.yaml safety.enable_real_trading == true
   4. 사용자가 real_confirm_text를 정확히 입력
-  5. 주문금액 <= max_real_order_amount
-  6. 일일 총 주문금액 <= max_real_daily_budget
+  5. 주문금액 <= max_real_order_amount  (매수만 적용)
+  6. 일일 총 주문금액 <= max_real_daily_budget  (매수만 적용)
 
-하나라도 실패하면 주문 차단 (RuntimeError 또는 success=False OrderResult 반환).
-API 키/토큰은 절대 로그에 출력하지 않습니다.
+gate 1~4: __init__에서 검사 → 브로커 자체를 못 만들게 차단
+gate 5~6: buy()에서 검사 → OrderResult(success=False) 반환
+sell()  : gate 5~6 체크 없음 (항상 매도 가능해야 함)
+get_positions(): API 오류 시 RuntimeError 발생 (UI가 st.error로 표시)
 """
 
 from app.trading.broker_base import BrokerBase
@@ -27,7 +29,7 @@ class KisRealBroker(BrokerBase):
         from app.config import get_config
         self._cfg = cfg or get_config()
 
-        # Safety gate 1+2+3: config 플래그 확인
+        # gate 2: kis.real.enabled
         kis_cfg = self._cfg._raw.get("kis", {})
         real_section = kis_cfg.get("real", {})
         if not real_section.get("enabled", False):
@@ -35,13 +37,15 @@ class KisRealBroker(BrokerBase):
                 "KIS real 계좌가 비활성화되어 있습니다. "
                 "config.yaml의 kis.real.enabled를 true로 설정하세요."
             )
+
+        # gate 3: safety.enable_real_trading
         if not self._cfg.real_trading_enabled():
             raise RuntimeError(
                 "실전투자 모드가 비활성화되어 있습니다. "
                 "config.yaml의 safety.enable_real_trading을 true로 설정하세요."
             )
 
-        # Safety gate 4: 확인 문구
+        # gate 4: 확인 문구
         expected = self._cfg.real_confirm_text()
         if self._cfg.require_real_confirm() and confirm_text != expected:
             raise RuntimeError(
@@ -52,7 +56,7 @@ class KisRealBroker(BrokerBase):
         self._daily_ordered_amount: float = 0.0
 
     # ------------------------------------------------------------------
-    # 주문 금액 안전장치 (gate 5+6)
+    # 주문 금액 안전장치 (gate 5+6, 매수 전용)
     # ------------------------------------------------------------------
 
     def _check_order_limits(self, quantity: int, price: float) -> str | None:
@@ -98,24 +102,25 @@ class KisRealBroker(BrokerBase):
             return 0.0
 
     def get_positions(self) -> list[Position]:
-        try:
-            result = self.kis.get_balance()
-            positions = []
-            for item in result.get("positions", []):
-                positions.append(
-                    Position(
-                        symbol=item["symbol"],
-                        name=item["name"],
-                        quantity=item["quantity"],
-                        avg_price=item["avg_price"],
-                        current_price=item["current_price"],
-                    )
+        """잔고 조회. API 오류 시 RuntimeError 발생."""
+        result = self.kis.get_balance()
+        if "error" in result:
+            err = result["error"]
+            logger.error("REAL get_positions 잔고 조회 오류: %s", err)
+            raise RuntimeError(f"KIS 실계좌 잔고 조회 실패: {err}")
+        positions = []
+        for item in (result.get("positions") or []):
+            positions.append(
+                Position(
+                    symbol=item["symbol"],
+                    name=item["name"],
+                    quantity=item["quantity"],
+                    avg_price=item["avg_price"],
+                    current_price=item["current_price"],
                 )
-            logger.info("REAL get_positions: %d 종목", len(positions))
-            return positions
-        except Exception as e:
-            logger.error("REAL get_positions 예외: %s", e)
-            return []
+            )
+        logger.info("REAL get_positions: %d 종목", len(positions))
+        return positions
 
     def buy(
         self,

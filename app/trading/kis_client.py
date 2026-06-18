@@ -210,24 +210,32 @@ class KISClient:
             resp = self._session.get(url, headers=headers, params=params, timeout=15)
             resp.raise_for_status()
             data = resp.json()
-            output2 = data.get("output2", [{}])
+
+            rt_cd = data.get("rt_cd", "")
+            if rt_cd != "0":
+                msg = data.get("msg1", "알 수 없는 오류")
+                logger.error(f"[KIS-{self.mode.upper()}] 잔고 조회 실패: rt_cd={rt_cd} msg={msg}")
+                return {"cash": 0.0, "positions": [], "error": f"API 오류(rt_cd={rt_cd}): {msg}"}
+
+            output2 = data.get("output2") or [{}]
             cash = float((output2[0] if output2 else {}).get("dnca_tot_amt", 0))
 
             positions = []
-            for item in data.get("output1", []):
-                qty = int(item.get("hldg_qty", 0))
+            for item in (data.get("output1") or []):
+                qty = int(item.get("hldg_qty", 0) or 0)
                 if qty <= 0:
                     continue
                 positions.append({
                     "symbol": item.get("pdno", ""),
                     "name": item.get("prdt_name", ""),
                     "quantity": qty,
-                    "avg_price": float(item.get("pchs_avg_pric", 0)),
-                    "current_price": float(item.get("prpr", 0)),
+                    "avg_price": float(item.get("pchs_avg_pric", 0) or 0),
+                    "current_price": float(item.get("prpr", 0) or 0),
                 })
+            logger.info(f"[KIS-{self.mode.upper()}] 잔고 조회 성공: {len(positions)}종목 현금={cash:,.0f}원")
             return {"cash": cash, "positions": positions}
         except Exception as e:
-            logger.error(f"[KIS-{self.mode.upper()}] 잔고 조회 실패: {e}")
+            logger.error(f"[KIS-{self.mode.upper()}] 잔고 조회 예외: {e}")
             return {"cash": 0.0, "positions": [], "error": str(e)}
 
     # ── 주문 가능 금액 ────────────────────────────────────────────────────

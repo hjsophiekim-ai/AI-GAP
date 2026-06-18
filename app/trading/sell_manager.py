@@ -23,6 +23,9 @@ class SellManager:
     def _stop_loss_rate(self) -> float:
         return float(self.cfg.trading.get("stop_loss_rate", -1.5))
 
+    def _bulk_sell_1150_time(self) -> str:
+        return self.cfg.trading.get("bulk_sell_1150_time", "11:50")
+
     def _force_sell_time(self) -> str:
         return self.cfg.trading.get("force_sell_time", "13:00")
 
@@ -113,6 +116,7 @@ class SellManager:
         if current_time is None:
             current_time = datetime.now().strftime("%H:%M")
 
+        bulk_1150_time = self._bulk_sell_1150_time()
         force_time = self._force_sell_time()
         emergency_time = self._emergency_sell_time()
 
@@ -122,13 +126,16 @@ class SellManager:
             action = "hold"
             reason = ""
 
-            # Check emergency first (later time takes precedence in reason label)
+            # Priority: emergency(15:10) > force(13:00) > bulk_1150(11:50)
             if current_time >= emergency_time:
                 action = "sell_all"
                 reason = f"{emergency_time} 비상청산"
             elif current_time >= force_time:
                 action = "sell_all"
                 reason = f"{force_time} 시간청산"
+            elif current_time >= bulk_1150_time:
+                action = "sell_all"
+                reason = f"{bulk_1150_time} 일괄청산"
 
             if action != "hold":
                 logger.info(

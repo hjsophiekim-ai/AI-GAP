@@ -123,6 +123,10 @@ class Candidate:
     liquidity_penalty: float = 0.0
     overheat_penalty: float = 0.0
     warning_reason: str = ""
+    penalty_reason: str = ""
+    fallback_included: bool = False
+    hard_excluded: bool = False
+    relaxed_mode_applied: bool = False
 
 
 @dataclass

@@ -383,3 +383,47 @@ class TestWarningHandling:
         passed, excluded = qf.filter_and_score([])
         assert passed == []
         assert excluded == []
+
+    def test_vwap_missing_warning_only(self):
+        """VWAP 없는 일봉 데이터 → 제외 안 되고 warning_reason에만 기록"""
+        qf = _default_filter()
+        c = _make_candidate()
+        # vwap 키 없는 daily
+        daily_no_vwap = _make_daily(25)
+        passed, excluded = qf.filter_and_score([c], daily_prices_cache={c.symbol: daily_no_vwap})
+        assert len(passed) == 1, "VWAP 없다고 제외되면 안 됨"
+        assert "VWAP" in passed[0].warning_reason
+
+    def test_subtheme_missing_no_crash(self):
+        """테마 데이터 없어도(theme='') 테마 cap 처리 중 crash 없음"""
+        qf = _default_filter({"max_same_theme_in_top15": 2})
+        candidates = [_make_candidate(symbol=f"00{i}930", name=f"종목{i}") for i in range(5)]
+        # theme 미설정 → 각 종목이 고유 테마 취급되어 모두 통과해야 함
+        passed, excluded = qf.filter_and_score(candidates)
+        assert len(passed) == 5
+
+
+# ---------------------------------------------------------------------------
+# final_score 우선 계산 테스트
+# ---------------------------------------------------------------------------
+
+class TestFinalScorePriority:
+
+    def test_ml_final_score_used_as_base(self):
+        """final_score > 0이면 rule_score 대신 final_score를 베이스로 사용"""
+        qf = _default_filter()
+        # rule_score=40, final_score=70 (ML 혼합 결과)
+        c = _make_candidate(rule_score=40.0)
+        c.final_score = 70.0  # ML 혼합 점수
+        passed, _ = qf.filter_and_score([c])
+        # 보정 후 final_score는 70 기반으로 계산되어야 하므로 40보다 높아야 함
+        assert passed[0].final_score > 40.0
+
+    def test_zero_final_score_falls_back_to_rule_score(self):
+        """final_score == 0이면 rule_score를 베이스로 사용"""
+        qf = _default_filter()
+        c = _make_candidate(rule_score=55.0)
+        c.final_score = 0.0
+        passed, _ = qf.filter_and_score([c])
+        # rule_score(55) 기반 계산이므로 final_score > 0 이어야 함
+        assert passed[0].final_score > 0.0

@@ -4,8 +4,7 @@
 보유종목 조회 후 다양한 매도 유형을 지원합니다.
 - 수동 일괄매도
 - 10:15 일괄매도 (예약)
-- 3% 절반매도 / 5% 전체매도
-- 2% 하락시 손절
+- 조건 매도 (수익률 기준: 절반매도 / 전량매도 / 손절)
 """
 import streamlit as st
 import pandas as pd
@@ -14,7 +13,6 @@ from datetime import datetime
 try:
     from app.trading.broker_factory import create_broker
     from app.trading.order_manager import OrderManager
-    from app.trading.sell_manager import SellManager
     from app.config import get_config
     from app.utils.stock_utils import format_amount, format_price, format_rate
 except Exception as e:
@@ -37,17 +35,18 @@ st.subheader("계좌 모드")
 
 selected_mode = st.selectbox(
     "계좌 모드",
-    options=["dry_run", "mock", "real"],
+    options=["mock", "real", "dry_run"],
     index=0,
     key="sell_page_mode",
+    help="mock: KIS 모의투자 | real: KIS 실전투자 | dry_run: 가상(앱 내부)",
 )
 
 if selected_mode == "dry_run":
-    st.info("드라이런 모드: 가상 포지션이 표시됩니다.")
+    st.info("드라이런 모드: 앱 내부 가상 포지션이 표시됩니다. (KIS 계좌 아님)")
 elif selected_mode == "mock":
-    st.warning("모의투자 모드: KIS 모의투자 계좌의 실제 보유종목이 표시됩니다.")
+    st.info("모의투자 모드: KIS 모의투자 계좌의 실제 보유종목이 표시됩니다.")
 elif selected_mode == "real":
-    st.error("실전투자 모드: 실제 KIS 계좌의 보유종목이 표시됩니다!")
+    st.warning("실전투자 모드: 실제 KIS 계좌의 보유종목이 표시됩니다!")
 
 confirm_text = ""
 if selected_mode == "real":
@@ -57,20 +56,20 @@ if selected_mode == "real":
     except Exception:
         expected_text = "I_UNDERSTAND_REAL_TRADING_RISK"
     confirm_text = st.text_input(
-        f"실전투자 확인 문구 입력 ('{expected_text}')",
+        f"실전투자 확인 문구 ('{expected_text}') — 조회/매수/매도 모두 필요",
         type="password",
         placeholder=expected_text,
         key="sell_page_confirm",
     )
     if confirm_text and confirm_text != expected_text:
-        st.error("확인 문구가 틀립니다. 매도 버튼이 비활성화됩니다.")
+        st.error("확인 문구가 틀립니다. 모든 기능이 비활성화됩니다.")
 
 if st.session_state.get("_sell_page_last_mode") != selected_mode:
     st.session_state.pop("sell_broker", None)
     st.session_state.pop("positions", None)
     st.session_state["_sell_page_last_mode"] = selected_mode
 
-real_sell_ok = (
+real_trade_ok = (
     selected_mode != "real"
     or (confirm_text and confirm_text == (
         get_config().real_confirm_text() if get_config else "I_UNDERSTAND_REAL_TRADING_RISK"
@@ -84,20 +83,57 @@ st.divider()
 # ---------------------------------------------------------------------------
 st.subheader("보유종목 조회")
 
-if st.button("보유종목 조회", key="btn_fetch_positions", use_container_width=False):
+col_fetch, col_refresh = st.columns([2, 5])
+with col_fetch:
+    fetch_clicked = st.button(
+        "보유종목 조회",
+        key="btn_fetch_positions",
+        use_container_width=True,
+        type="primary",
+    )
+with col_refresh:
+    if st.button("새로고침 (현재가 업데이트)", key="btn_refresh_prices", use_container_width=True):
+        broker_cached = st.session_state.get("sell_broker")
+        positions_cached = st.session_state.get("positions", [])
+        if broker_cached and positions_cached:
+            with st.spinner("현재가 업데이트 중..."):
+                for p in positions_cached:
+                    try:
+                        price = broker_cached.get_current_price(p.symbol)
+                        if price:
+                            p.current_price = price
+                    except Exception:
+                        pass
+            st.session_state["positions"] = positions_cached
+            st.success("현재가 업데이트 완료")
+        else:
+            st.warning("먼저 보유종목을 조회하세요.")
+
+if fetch_clicked:
     with st.spinner("보유종목을 조회하는 중..."):
         try:
             cfg = get_config()
             broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text)
             st.session_state["sell_broker"] = broker
+            broker_type = type(broker).__name__
             positions = broker.get_positions()
             st.session_state["positions"] = positions
+            st.session_state["broker_type"] = broker_type
+            if selected_mode != "dry_run":
+                st.success(f"조회 완료: {len(positions)}종목 (브로커: {broker_type})")
         except RuntimeError as exc:
-            st.error(f"브로커 초기화 실패 (안전장치): {exc}")
+            st.error(f"오류: {exc}")
         except Exception as exc:
             st.error(f"보유종목 조회 실패: {exc}")
 
 positions = st.session_state.get("positions", [])
+
+if st.session_state.get("broker_type") and positions is not None:
+    mode_label = {"KisMockBroker": "KIS 모의투자", "KisRealBroker": "KIS 실전투자",
+                  "DryRunBroker": "가상(드라이런)"}.get(
+        st.session_state["broker_type"], st.session_state["broker_type"]
+    )
+    st.caption(f"연결 계좌: {mode_label}")
 
 if positions:
     total_market_value = sum(p.market_value for p in positions)
@@ -192,7 +228,9 @@ sell_type = st.radio(
     options=[
         "조건 매도 (수익률 기준)",
         "수동 일괄매도",
+        "선택 매도",
         "10:15 일괄매도 (예약)",
+        "11:50 일괄매도 (예약)",
     ],
     horizontal=True,
 )
@@ -227,7 +265,7 @@ def _save_and_show_results(results, order_mgr):
 if sell_type == "조건 매도 (수익률 기준)":
     st.write(f"- **+{tp1_rate:.0f}%** 도달 종목: 절반 매도")
     st.write(f"- **+{tp2_rate:.0f}%** 도달 종목: 전량 매도")
-    st.write(f"- **-{sl_rate:.0f}%** 하락 종목: 손절 전량 매도 (2% 하락 익절 포함)")
+    st.write(f"- **-{sl_rate:.0f}%** 하락 종목: 손절 전량 매도")
 
     if not has_positions:
         st.warning("먼저 보유종목을 조회하세요.")
@@ -258,7 +296,7 @@ if sell_type == "조건 매도 (수익률 기준)":
                 st.write(f"- **{plan['name']}** ({plan['symbol']}) | {action_label} {plan['quantity']}주 | {plan['reason']}")
 
             confirm_cond = st.checkbox("위 매도 내역을 확인했습니다", key="chk_cond_sell")
-            if st.button("조건 매도 실행", disabled=not (confirm_cond and real_sell_ok), type="primary"):
+            if st.button("조건 매도 실행", disabled=not (confirm_cond and real_trade_ok), type="primary"):
                 try:
                     broker = _get_or_create_broker()
                     cfg = get_config()
@@ -292,7 +330,7 @@ elif sell_type == "수동 일괄매도":
         confirm_bulk = st.checkbox("전체 매도를 확인했습니다", key="chk_bulk_sell")
         if st.button(
             "일괄매도 실행",
-            disabled=not (confirm_bulk and real_sell_ok),
+            disabled=not (confirm_bulk and real_trade_ok),
             type="primary",
             use_container_width=True,
         ):
@@ -308,11 +346,61 @@ elif sell_type == "수동 일괄매도":
             except Exception as exc:
                 st.error(f"매도 실패: {exc}")
 
+# ── 선택 매도 ──────────────────────────────────────────────────────────────
+elif sell_type == "선택 매도":
+    if not has_positions:
+        st.warning("먼저 보유종목을 조회하세요.")
+    else:
+        option_labels = [
+            f"{p.name} ({p.symbol})  |  수익률: {format_rate(p.profit_rate)}  |  {p.quantity}주  |  현재가: {format_price(p.current_price)}"
+            for p in positions
+        ]
+        selected_labels = st.multiselect(
+            "매도할 종목 선택 (복수 선택 가능)",
+            options=option_labels,
+            default=[],
+            placeholder="종목을 선택하세요",
+            key="sel_sell_symbols",
+        )
+
+        label_to_pos = dict(zip(option_labels, positions))
+        selected_positions_sell = [label_to_pos[l] for l in selected_labels if l in label_to_pos]
+
+        if selected_positions_sell:
+            total_market_val_sel = sum(p.market_value for p in selected_positions_sell)
+            total_pnl_sel = sum(p.profit_amount for p in selected_positions_sell)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("선택 종목", f"{len(selected_positions_sell)}개")
+            c2.metric("예상 매도금액", format_amount(total_market_val_sel))
+            c3.metric("예상 손익", format_amount(total_pnl_sel))
+
+            confirm_sel_sell = st.checkbox("위 종목을 즉시 매도하겠습니다", key="chk_sel_sell")
+            if st.button(
+                "선택 종목 즉시 매도",
+                disabled=not (confirm_sel_sell and real_trade_ok),
+                type="primary",
+                use_container_width=True,
+                key="btn_sel_sell",
+            ):
+                try:
+                    broker = _get_or_create_broker()
+                    cfg = get_config()
+                    order_mgr = OrderManager(broker, cfg=cfg)
+                    with st.spinner(f"{len(selected_positions_sell)}개 종목 매도 중..."):
+                        sel_sell_results = order_mgr.execute_sell_all(selected_positions_sell)
+                    _save_and_show_results(sel_sell_results, order_mgr)
+                except RuntimeError as exc:
+                    st.error(f"안전장치 차단: {exc}")
+                except Exception as exc:
+                    st.error(f"매도 실패: {exc}")
+        else:
+            st.info("위에서 매도할 종목을 선택하세요.")
+
 # ── 10:15 일괄매도 ─────────────────────────────────────────────────────────
 elif sell_type == "10:15 일괄매도 (예약)":
     now = datetime.now()
     h, m = now.hour, now.minute
-    is_1015 = (h == 10 and 13 <= m <= 17)  # 10:13~10:17 허용
+    is_1015 = (h == 10 and 13 <= m <= 17)
 
     st.markdown(f"**현재 시각**: {now.strftime('%H:%M:%S')}")
 
@@ -324,11 +412,10 @@ elif sell_type == "10:15 일괄매도 (예약)":
     if not has_positions:
         st.warning("먼저 보유종목을 조회하세요.")
     else:
-        sell_disabled = not is_1015 or not real_sell_ok
         confirm_sched = st.checkbox("10:15 일괄매도를 확인했습니다", key="chk_sched_sell")
         if st.button(
             "10:15 일괄매도 실행",
-            disabled=not (is_1015 and confirm_sched and real_sell_ok),
+            disabled=not (is_1015 and confirm_sched and real_trade_ok),
             type="primary",
             use_container_width=True,
         ):
@@ -346,6 +433,48 @@ elif sell_type == "10:15 일괄매도 (예약)":
 
         if not is_1015:
             st.caption(f"현재 {now.strftime('%H:%M')} — 10:13~10:17 사이에만 활성화됩니다.")
+
+# ── 11:50 일괄매도 ─────────────────────────────────────────────────────────
+elif sell_type == "11:50 일괄매도 (예약)":
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    is_1150 = (h == 11 and 48 <= m <= 52)
+
+    st.markdown(f"**현재 시각**: {now.strftime('%H:%M:%S')}")
+    st.info(
+        "갭상승 당일 점심 직전 청산 전략입니다.  \n"
+        "11:48~11:52 사이에 버튼이 활성화됩니다."
+    )
+
+    if is_1150:
+        st.success("11:50 매도 시간입니다! 아래 버튼을 눌러 일괄매도를 실행하세요.")
+    else:
+        st.info("11:50 일괄매도 대기 중 — 11:48~11:52 사이에 버튼이 활성화됩니다.")
+
+    if not has_positions:
+        st.warning("먼저 보유종목을 조회하세요.")
+    else:
+        confirm_1150 = st.checkbox("11:50 일괄매도를 확인했습니다", key="chk_1150_sell")
+        if st.button(
+            "11:50 일괄매도 실행",
+            disabled=not (is_1150 and confirm_1150 and real_trade_ok),
+            type="primary",
+            use_container_width=True,
+        ):
+            try:
+                broker = _get_or_create_broker()
+                cfg = get_config()
+                order_mgr = OrderManager(broker, cfg=cfg)
+                with st.spinner("11:50 일괄매도 중..."):
+                    sell_1150_results = order_mgr.execute_sell_all(positions)
+                _save_and_show_results(sell_1150_results, order_mgr)
+            except RuntimeError as exc:
+                st.error(f"안전장치 차단: {exc}")
+            except Exception as exc:
+                st.error(f"매도 실패: {exc}")
+
+        if not is_1150:
+            st.caption(f"현재 {now.strftime('%H:%M')} — 11:48~11:52 사이에만 활성화됩니다.")
 
 # ---------------------------------------------------------------------------
 # Section 4 — 매도 결과

@@ -169,9 +169,9 @@ st.subheader("매수 실행")
 
 buy_type = st.radio(
     "매수 유형",
-    options=["수동 매수", "9:20 일괄매수 (예약)"],
+    options=["수동 매수", "9:20 일괄매수 (예약)", "종목 선택 매수"],
     horizontal=True,
-    help="수동: 버튼 클릭 즉시 실행 | 9:20 예약: 9시 20분에 실행 가능 (직접 클릭 필요)",
+    help="수동: 즉시 전종목 매수 | 9:20 예약: 9:20에 활성화 | 선택: 원하는 종목만 골라서 매수",
 )
 
 has_plan = bool(buy_plan)
@@ -181,6 +181,8 @@ real_confirm_ok = (
         get_config().real_confirm_text() if get_config else "I_UNDERSTAND_REAL_TRADING_RISK"
     ))
 )
+
+_execute_buy = False  # 수동/9:20 공통 실행 플래그
 
 # ── 수동 매수 ──────────────────────────────────────────────────────────────
 if buy_type == "수동 매수":
@@ -192,8 +194,6 @@ if buy_type == "수동 매수":
         use_container_width=True,
     ):
         _execute_buy = True
-    else:
-        _execute_buy = False
 
     if not has_plan:
         st.caption("먼저 예산 배분 계산을 실행하세요.")
@@ -201,7 +201,7 @@ if buy_type == "수동 매수":
         st.caption("실전투자 확인 문구를 입력해야 활성화됩니다.")
 
 # ── 9:20 일괄매수 예약 ────────────────────────────────────────────────────
-else:
+elif buy_type == "9:20 일괄매수 (예약)":
     now = datetime.now()
     h, m = now.hour, now.minute
     is_920 = (h == 9 and 18 <= m <= 22)  # 9:18~9:22 허용 범위
@@ -211,22 +211,109 @@ else:
     if is_920:
         st.success("9:20 매수 시간입니다! 아래 버튼을 눌러 매수를 실행하세요.")
     else:
-        target = "09:20"
-        st.info(f"9:20 일괄매수 예약 중 — 목표 시각: {target}. 시간이 되면 버튼이 활성화됩니다.")
+        st.info("9:20 일괄매수 예약 중 — 9:18~9:22 사이에 버튼이 활성화됩니다.")
 
     buy_disabled = not has_plan or not is_920 or not real_confirm_ok
     if st.button(
-        f"9:20 일괄매수 실행",
+        "9:20 일괄매수 실행",
         disabled=buy_disabled,
         type="primary",
         use_container_width=True,
     ):
         _execute_buy = True
-    else:
-        _execute_buy = False
 
     if not is_920:
         st.caption(f"현재 {now.strftime('%H:%M')} — 9:18~9:22 사이에만 버튼이 활성화됩니다.")
+
+# ── 종목 선택 매수 ────────────────────────────────────────────────────────
+elif buy_type == "종목 선택 매수":
+    if not buy_plan:
+        st.warning("먼저 위에서 '예산 배분 계산'을 실행하세요.")
+    else:
+        option_labels = [
+            f"#{p.rank}  {p.name} ({p.symbol})  |  {format_price(p.current_price)}  |  {format_amount(p.allocated_amount)} / {p.allocated_quantity}주"
+            for p in buy_plan
+        ]
+        selected_labels = st.multiselect(
+            "매수할 종목 선택 (복수 선택 가능)",
+            options=option_labels,
+            default=[],
+            placeholder="종목을 선택하세요",
+            key="sel_buy_symbols",
+        )
+
+        label_to_plan = dict(zip(option_labels, buy_plan))
+        selected_plan = [label_to_plan[l] for l in selected_labels if l in label_to_plan]
+
+        if selected_plan:
+            total_sel_amount = sum(p.allocated_amount for p in selected_plan)
+            c1, c2 = st.columns(2)
+            c1.metric("선택 종목", f"{len(selected_plan)}개")
+            c2.metric("예상 투자금", format_amount(total_sel_amount))
+
+            confirm_sel = st.checkbox("위 종목을 매수하겠습니다", key="chk_sel_buy")
+            if st.button(
+                "선택 종목 매수 실행",
+                disabled=not (confirm_sel and real_confirm_ok),
+                type="primary",
+                use_container_width=True,
+                key="btn_sel_buy",
+            ):
+                try:
+                    cfg = get_config()
+                    with st.spinner("브로커 초기화 중..."):
+                        broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text)
+                    order_manager = OrderManager(broker=broker, cfg=cfg)
+
+                    with st.spinner(f"{len(selected_plan)}개 종목 매수 중..."):
+                        sel_results = order_manager.execute_buy_plans(selected_plan)
+
+                    st.session_state["buy_results"] = sel_results
+                    try:
+                        log_path = order_manager.save_order_log(sel_results)
+                        st.caption(f"주문 로그: {log_path}")
+                    except Exception:
+                        pass
+
+                    result_rows = [
+                        {
+                            "종목코드": r.symbol,
+                            "종목명": r.name,
+                            "수량": r.quantity,
+                            "가격": format_price(r.price),
+                            "주문번호": r.order_id,
+                            "결과": "성공" if r.success else "실패",
+                            "메시지": r.message,
+                        }
+                        for r in sel_results
+                    ]
+                    if result_rows:
+                        def _hl_sel(row):
+                            color = "#d4edda" if "성공" in str(row["결과"]) else "#f8d7da"
+                            return [f"background-color:{color}"] * len(row)
+                        df_sel = pd.DataFrame(result_rows)
+                        st.dataframe(df_sel.style.apply(_hl_sel, axis=1), use_container_width=True, hide_index=True)
+
+                    success_count = sum(1 for r in sel_results if r.success)
+                    fail_count = len(sel_results) - success_count
+                    rc1, rc2 = st.columns(2)
+                    rc1.metric("매수 성공", success_count)
+                    rc2.metric("매수 실패", fail_count)
+
+                    if sel_results and all(r.success for r in sel_results):
+                        st.balloons()
+                        st.success("선택 종목 매수 완료!")
+                    elif success_count > 0:
+                        st.warning(f"{success_count}개 성공 / {fail_count}개 실패")
+                    else:
+                        st.error("매수 주문이 모두 실패했습니다.")
+
+                except RuntimeError as e:
+                    st.error(f"안전장치 차단: {e}")
+                except Exception as e:
+                    st.error(f"매수 오류: {e}")
+        else:
+            st.info("위에서 매수할 종목을 선택하세요.")
 
 # ── 공통 매수 실행 로직 ───────────────────────────────────────────────────
 if _execute_buy:

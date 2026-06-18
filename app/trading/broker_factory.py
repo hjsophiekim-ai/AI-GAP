@@ -37,11 +37,15 @@ def create_broker(cfg=None, mode: str = None, confirm_text: str = "") -> BrokerB
         from app.trading.kis_client import create_kis_client
         kis = create_kis_client(effective_mode)
         if kis is None:
-            logger.warning(
-                "KIS %s 클라이언트 생성 실패 → DryRunBroker로 대체합니다.", effective_mode
+            env_hint = (
+                "KIS_MOCK_APP_KEY, KIS_MOCK_APP_SECRET, KIS_MOCK_ACCOUNT_NO"
+                if effective_mode == "mock"
+                else "KIS_REAL_APP_KEY, KIS_REAL_APP_SECRET, KIS_ACCOUNT_NO"
             )
-            from app.trading.dry_run_broker import DryRunBroker
-            return DryRunBroker()
+            raise RuntimeError(
+                f"KIS {effective_mode} 클라이언트 초기화 실패. "
+                f".env 파일에 {env_hint} 를 설정하세요."
+            )
 
         if effective_mode == "mock":
             from app.trading.kis_mock_broker import KisMockBroker

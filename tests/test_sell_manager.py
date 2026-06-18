@@ -117,3 +117,35 @@ def test_emergency_exit_1510():
     assert len(results) == 2
     for r in results:
         assert r["action"] == "sell_all"
+
+
+def test_time_exit_1150():
+    """At 11:50 all positions should get action=sell_all with '11:50' in reason."""
+    sm = SellManager(cfg=_StubConfig(bulk_sell_1150_time="11:50"))
+    positions = [
+        _position("000001", avg_price=10000, current_price=10050),
+        _position("000002", avg_price=20000, current_price=20100),
+    ]
+    results = sm.check_time_exits(positions, current_time="11:50")
+    assert len(results) == 2
+    for r in results:
+        assert r["action"] == "sell_all"
+        assert "11:50" in r["reason"]
+
+
+def test_before_1150_no_time_exit():
+    """At 11:49, 11:50 bulk sell should NOT trigger."""
+    sm = SellManager(cfg=_StubConfig(bulk_sell_1150_time="11:50"))
+    positions = [_position("000001", avg_price=10000, current_price=10050)]
+    results = sm.check_time_exits(positions, current_time="11:49")
+    assert len(results) == 0
+
+
+def test_1300_overrides_1150():
+    """At 13:00, reason should reference 13:00 (force_sell_time), not 11:50."""
+    sm = SellManager(cfg=_StubConfig(bulk_sell_1150_time="11:50"))
+    positions = [_position("000001", avg_price=10000, current_price=10050)]
+    results = sm.check_time_exits(positions, current_time="13:00")
+    assert len(results) == 1
+    assert "13:00" in results[0]["reason"]
+    assert "11:50" not in results[0]["reason"]

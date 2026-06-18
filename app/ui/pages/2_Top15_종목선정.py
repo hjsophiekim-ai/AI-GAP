@@ -234,12 +234,15 @@ if st.button("Top15 종목선정하기", type="primary", use_container_width=Tru
         progress.progress(25, text="STEP 2: ETF/거래정지/위험종목 제외 중...")
         _log("STEP 2: ETF / 거래정지 / 위험종목 제외")
 
-        valid_stocks: list[dict] = []
+        valid_stocks = []
         excluded_stocks: list[dict] = []
         for s in raw_stocks:
             excl, reason = _is_excluded(s)
             if excl:
-                excluded_stocks.append({**s, "reason": reason})
+                # StockData 객체는 mapping이 아니므로 직접 dict 구성
+                sym  = s.symbol if hasattr(s, "symbol") else s.get("symbol", "")
+                name = s.name   if hasattr(s, "name")   else s.get("name", "")
+                excluded_stocks.append({"symbol": sym, "name": name, "reason": reason})
             else:
                 valid_stocks.append(s)
 
@@ -347,17 +350,49 @@ if st.button("Top15 종목선정하기", type="primary", use_container_width=Tru
 # 결과 표시
 # ---------------------------------------------------------------------------
 
+
+def _risk_label(c) -> str:
+    """risk_comment + fallback 여부를 합쳐 표시용 문자열 반환."""
+    parts = []
+    rc = (c.risk_comment or "").strip()
+    if rc:
+        parts.append(rc)
+    if getattr(c, "fallback_included", False):
+        parts.append("완화기준포함")
+    return ", ".join(parts)
+
+
 if st.session_state.get("top15"):
     top15 = st.session_state["top15"]
     selected_at = st.session_state.get("top15_selected_at", "")
     if selected_at:
         st.caption(f"선정 시각: {selected_at}")
 
+    n_risky = sum(1 for c in top15 if _risk_label(c))
+    n_safe = len(top15) - n_risky
+
+    # 요약 카드
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("선정 종목", f"{len(top15)}개")
+    with col2:
+        st.metric("정상", f"{n_safe}개")
+    with col3:
+        st.metric("위험신호 🔴", f"{n_risky}개")
+
+    if n_risky > 0:
+        st.caption(
+            "🔴 위험신호 종목은 조건 완화로 포함된 종목입니다. "
+            "표 하단 '위험신호 상세'에서 사유를 확인하세요."
+        )
+
     rows = []
     for c in top15:
         medal = {1: "1", 2: "2", 3: "3"}.get(c.rank, str(c.rank))
+        risk = _risk_label(c)
         rows.append({
             "순위": medal,
+            "위험": "🔴" if risk else "⚪",
             "종목코드": c.symbol,
             "종목명": c.name,
             "현재가": f"{int(c.current_price):,}",
@@ -371,10 +406,31 @@ if st.session_state.get("top15"):
 
     df = pd.DataFrame(rows)
     st.dataframe(
-        df.style.applymap(_style_score, subset=["최종점수"]),
+        df.style.map(_style_score, subset=["최종점수"]),
         use_container_width=True,
         hide_index=True,
+        column_config={"위험": st.column_config.TextColumn("위험", width=50)},
     )
+
+    # 위험신호 종목 상세
+    risky_items = [c for c in top15 if _risk_label(c)]
+    if risky_items:
+        with st.expander(f"🔴 위험신호 종목 상세 ({len(risky_items)}개)"):
+            detail_rows = []
+            for c in risky_items:
+                detail_rows.append({
+                    "종목코드": c.symbol,
+                    "종목명": c.name,
+                    "위험사유": _risk_label(c),
+                    "갭률(%)": round(c.gap_rate, 2),
+                    "시가대비(%)": round(c.open_to_current_rate, 2),
+                    "거래대금": _fmt_trade_value(c.trade_value),
+                })
+            st.dataframe(
+                pd.DataFrame(detail_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     # 제외 종목
     excluded = st.session_state.get("excluded_stocks", [])

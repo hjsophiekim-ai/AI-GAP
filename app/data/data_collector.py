@@ -40,7 +40,18 @@ class DataCollector:
         )
         if has_kis:
             try:
-                self._kis = KISMarketData(cfg=self.cfg)
+                import os
+                app_key = os.getenv(mock_section.get("app_key_env", ""), "")
+                app_secret = os.getenv(mock_section.get("app_secret_env", ""), "")
+                account_no = os.getenv(mock_section.get("account_no_env", ""), "")
+                product_code = os.getenv(mock_section.get("product_code_env", ""), "01")
+                self._kis = KISMarketData(
+                    app_key=app_key,
+                    app_secret=app_secret,
+                    account_no=account_no,
+                    product_code=product_code,
+                    use_paper=True,
+                )
             except Exception as e:
                 logger.warning(f"KISMarketData 초기화 실패: {e}")
                 self._kis = None
