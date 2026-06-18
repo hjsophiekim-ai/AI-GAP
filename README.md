@@ -370,6 +370,34 @@ I_UNDERSTAND_REAL_TRADING_RISK
 
 ---
 
+## Render 배포
+
+서비스 URL: **https://ai-gap.onrender.com**
+
+자세한 설정은 [docs/deploy_render.md](docs/deploy_render.md)를 참조하세요.
+
+### 핵심 설정
+
+| 항목 | 값 |
+|------|----|
+| Runtime | Python 3 |
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `streamlit run app/ui/streamlit_app.py --server.address 0.0.0.0 --server.port $PORT` |
+
+### 필수 환경변수 (Render 대시보드 > Environment)
+
+```
+KIS_MOCK_APP_KEY          KIS_REAL_APP_KEY
+KIS_MOCK_APP_SECRET       KIS_REAL_APP_SECRET
+KIS_MOCK_ACCOUNT_NO       KIS_ACCOUNT_NO
+KIS_MOCK_ACCOUNT_PRODUCT_CODE   KIS_REAL_ACCOUNT_PRODUCT_CODE
+DART_API_KEY              REAL_ORDER_CONFIRM_TEXT
+ENABLE_REAL_TRADING       ENABLE_REAL_BUY
+ENABLE_REAL_SELL          DEFAULT_TRADING_MODE
+```
+
+---
+
 ## 테스트 실행
 
 ```bash

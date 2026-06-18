@@ -8,8 +8,154 @@ load_dotenv(_ROOT / ".env")
 
 _CONFIG_PATH = _ROOT / "config.yaml"
 
+_DEFAULT_CONFIG = {
+    "mode": "dry_run",
+    "trading": {
+        "total_budget": 10000000,
+        "max_positions": 15,
+        "max_shares_per_stock": 2,
+        "min_gap_rate": 1.0,
+        "max_gap_rate": 20.0,
+        "min_trade_value": 300000000,
+        "buy_start_time": "09:05",
+        "buy_end_time": "09:10",
+        "first_take_profit_rate": 3.0,
+        "second_take_profit_rate": 5.0,
+        "stop_loss_rate": -1.5,
+        "bulk_sell_1150_time": "11:50",
+        "force_sell_time": "13:00",
+        "emergency_sell_time": "15:10",
+        "order_type": "limit",
+        "allow_market_order": False,
+        "min_price": 1000,
+    },
+    "filters": {
+        "exclude_etf": True,
+        "exclude_etn": True,
+        "exclude_preferred_stock": True,
+        "exclude_spac": True,
+        "exclude_reit": True,
+        "exclude_warning_stock": True,
+        "exclude_halt": True,
+        "min_price": 1000,
+        "max_spread_rate": 1.0,
+    },
+    "data_source": {
+        "pre_market_primary": "naver",
+        "regular_market_primary": "kis",
+        "secondary": "naver",
+        "use_naver_gap_tab": True,
+        "use_naver_volume_tab": True,
+        "market_open_time": "09:00",
+    },
+    "naver": {"sise_url": "https://finance.naver.com/sise/"},
+    "kis": {
+        "real": {
+            "enabled": False,
+            "app_key_env": "KIS_REAL_APP_KEY",
+            "app_secret_env": "KIS_REAL_APP_SECRET",
+            "account_no_env": "KIS_ACCOUNT_NO",
+            "account_product_code_env": "KIS_ACCOUNT_PRODUCT_CODE",
+            "product_code_env": "KIS_ACCOUNT_PRODUCT_CODE",
+            "base_url": "https://openapi.koreainvestment.com:9443",
+        },
+        "mock": {
+            "enabled": True,
+            "app_key_env": "KIS_MOCK_APP_KEY",
+            "app_secret_env": "KIS_MOCK_APP_SECRET",
+            "account_no_env": "KIS_MOCK_ACCOUNT_NO",
+            "account_product_code_env": "KIS_MOCK_ACCOUNT_PRODUCT_CODE",
+            "product_code_env": "KIS_MOCK_ACCOUNT_PRODUCT_CODE",
+            "base_url": "https://openapivts.koreainvestment.com:29443",
+        },
+    },
+    "dart": {
+        "enabled": True,
+        "api_key_env": "DART_API_KEY",
+        "lookback_days": 7,
+        "use_disclosure_score": True,
+        "disclosure_score_weight": 0.10,
+        "max_positive_bonus": 10,
+        "max_negative_penalty": -20,
+        "exclude_severe_risk_disclosure": True,
+    },
+    "ml": {
+        "use_model": True,
+        "fallback_to_rule_score": True,
+        "model_path": "models/gap_model.pkl",
+        "feature_importance_path": "models/feature_importance.csv",
+        "min_training_rows": 500,
+        "ml_weight": 0.6,
+        "rule_weight": 0.4,
+    },
+    "safety": {
+        "enable_real_trading": False,
+        "enable_real_buy": False,
+        "enable_real_sell": False,
+        "require_real_order_confirm_text": True,
+        "real_order_confirm_text": os.getenv("REAL_ORDER_CONFIRM_TEXT", "REAL_ORDER_CONFIRMED"),
+        "max_order_amount": 1000000,
+        "max_daily_order_amount": 3000000,
+        "max_daily_loss_rate": -5.0,
+        "require_real_confirm": True,
+        "real_confirm_text": os.getenv("REAL_ORDER_CONFIRM_TEXT", "REAL_ORDER_CONFIRMED"),
+        "max_real_order_amount": 1000000,
+        "max_real_daily_budget": 3000000,
+    },
+    "volume_spike": {
+        "enabled": True,
+        "source_url": "https://finance.naver.com/sise/sise_quant_high.naver",
+        "target_top_n": 10,
+        "min_price": 20000,
+        "min_change_rate": 3.0,
+        "max_change_rate": 18.0,
+        "min_trading_value": 3000000000,
+        "fallback_min_trading_value": 1000000000,
+        "fallback_min_price": 10000,
+        "exclude_etf": True,
+        "exclude_etn": True,
+        "exclude_preferred": True,
+        "exclude_spac": True,
+        "exclude_reit": True,
+        "exclude_suspended": True,
+        "quality_stock_preference": True,
+        "max_candidates_to_score": 80,
+    },
+    "logging": {"save_csv": True, "save_db": False, "level": "INFO", "log_dir": "logs"},
+    "candidate_quality_filters": {
+        "enabled": True,
+        "speed_mode": True,
+        "relaxed_mode": True,
+        "target_min_candidates": 10,
+        "target_top_n": 15,
+        "min_price": 1000,
+        "absolute_min_trading_value": 300000000,
+        "min_trading_value_general": 700000000,
+        "min_trading_value_0920": 1000000000,
+        "healthy_gap_min": 1.0,
+        "healthy_gap_max": 9.0,
+        "caution_gap_max": 15.0,
+        "hard_exclude_gap_rate": 20.0,
+        "caution_gap_rate": 7.0,
+        "max_open_gap_rate": 12.0,
+        "max_3d_return": 25.0,
+        "max_5d_return": 35.0,
+        "max_intraday_drop_from_high": 4.0,
+        "max_ma20_extension_rate": 15.0,
+        "max_same_theme_in_top15": 5,
+        "max_same_subtheme_in_top15": 4,
+        "max_candidates_for_heavy_filters": 30,
+    },
+}
+
 
 def _load_yaml() -> dict:
+    if not _CONFIG_PATH.exists():
+        import logging
+        logging.getLogger(__name__).warning(
+            "config.yaml not found at %s — using safe defaults.", _CONFIG_PATH
+        )
+        return _DEFAULT_CONFIG.copy()
     with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -61,13 +207,27 @@ class Config:
         return self._raw.get("dart", {})
 
     def real_trading_enabled(self) -> bool:
-        return self.safety.get("enable_real_trading", False)
+        return bool(self.safety.get("enable_real_trading", False))
+
+    def real_buy_enabled(self) -> bool:
+        return bool(self.safety.get("enable_real_buy", False))
+
+    def real_sell_enabled(self) -> bool:
+        return bool(self.safety.get("enable_real_sell", False))
 
     def require_real_confirm(self) -> bool:
-        return self.safety.get("require_real_confirm", True)
+        """새 키 우선, 구 키 fallback."""
+        val = self.safety.get("require_real_order_confirm_text")
+        if val is None:
+            val = self.safety.get("require_real_confirm", True)
+        return bool(val)
 
     def real_confirm_text(self) -> str:
-        return self.safety.get("real_confirm_text", "I_UNDERSTAND_REAL_TRADING_RISK")
+        """새 키 우선, 구 키 fallback."""
+        return (
+            self.safety.get("real_order_confirm_text")
+            or self.safety.get("real_confirm_text", "REAL_ORDER_CONFIRMED")
+        )
 
 
 def get_kis_account_config(mode: str) -> dict:
