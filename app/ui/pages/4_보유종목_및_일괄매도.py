@@ -13,7 +13,9 @@ from datetime import datetime
 try:
     from app.trading.broker_factory import create_broker
     from app.trading.order_manager import OrderManager
+    from app.trading.kis_client import create_kis_client
     from app.config import get_config
+    from app.models import Position
     from app.utils.stock_utils import format_amount, format_price, format_rate
 except Exception as e:
     st.error(f"모듈 로드 오류: {e}")
@@ -59,9 +61,9 @@ if selected_mode == "real":
         )
         _runtime_real_mode = True
     else:
-        st.error(
+        st.warning(
             "실전모드가 활성화되어 있지 않습니다.  \n"
-            "'API 연결' 페이지에서 실전모드 버튼을 먼저 활성화하세요."
+            "보유종목 **조회**는 가능하지만, **매도 실행**은 'API 연결' 페이지에서 실전모드를 먼저 활성화하세요."
         )
 
 confirm_text = ""
@@ -72,7 +74,7 @@ if selected_mode == "real":
     except Exception:
         expected_text = "I_UNDERSTAND_REAL_TRADING_RISK"
     confirm_text = st.text_input(
-        f"실전투자 확인 문구 ('{expected_text}') — 조회/매수/매도 모두 필요",
+        f"실전투자 확인 문구 ('{expected_text}') — 매도 실행 시 필요 (조회는 불필요)",
         type="password",
         placeholder=expected_text,
         key="sell_page_confirm",
@@ -83,13 +85,16 @@ if selected_mode == "real":
 if st.session_state.get("_sell_page_last_mode") != selected_mode:
     st.session_state.pop("sell_broker", None)
     st.session_state.pop("positions", None)
+    st.session_state.pop("_sell_kis_client", None)
     st.session_state["_sell_page_last_mode"] = selected_mode
 
 real_trade_ok = (
     selected_mode != "real"
-    or (confirm_text and confirm_text == (
-        get_config().real_confirm_text() if get_config else "I_UNDERSTAND_REAL_TRADING_RISK"
-    ))
+    or (
+        _runtime_real_mode
+        and confirm_text
+        and confirm_text == get_config().real_confirm_text()
+    )
 )
 
 st.divider()
@@ -109,15 +114,21 @@ with col_fetch:
     )
 with col_refresh:
     if st.button("새로고침 (현재가 업데이트)", key="btn_refresh_prices", use_container_width=True):
-        broker_cached = st.session_state.get("sell_broker")
         positions_cached = st.session_state.get("positions", [])
-        if broker_cached and positions_cached:
+        kis_cached = st.session_state.get("_sell_kis_client")
+        broker_cached = st.session_state.get("sell_broker")
+        if positions_cached and (kis_cached or broker_cached):
             with st.spinner("현재가 업데이트 중..."):
                 for p in positions_cached:
                     try:
-                        price = broker_cached.get_current_price(p.symbol)
-                        if price:
-                            p.current_price = price
+                        if kis_cached:
+                            result = kis_cached.get_current_price(p.symbol)
+                            if result and result.get("current_price"):
+                                p.current_price = result["current_price"]
+                        elif broker_cached:
+                            price = broker_cached.get_current_price(p.symbol)
+                            if price:
+                                p.current_price = price
                     except Exception:
                         pass
             st.session_state["positions"] = positions_cached
@@ -129,14 +140,46 @@ if fetch_clicked:
     with st.spinner("보유종목을 조회하는 중..."):
         try:
             cfg = get_config()
-            broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text, runtime_real_mode=_runtime_real_mode)
-            st.session_state["sell_broker"] = broker
-            broker_type = type(broker).__name__
-            positions = broker.get_positions()
+            if selected_mode == "dry_run":
+                # dry_run: 브로커 통해 메모리 내 가상 포지션 조회
+                broker = create_broker(cfg=cfg, mode="dry_run")
+                st.session_state["sell_broker"] = broker
+                positions = broker.get_positions()
+                broker_type = "DryRunBroker"
+            else:
+                # mock/real: KIS API 직접 호출 (보유종목 조회는 읽기 전용 — 안전게이트 불필요)
+                env_hints = {
+                    "mock": "KIS_MOCK_APP_KEY, KIS_MOCK_APP_SECRET, KIS_MOCK_ACCOUNT_NO",
+                    "real": "KIS_REAL_APP_KEY, KIS_REAL_APP_SECRET, KIS_ACCOUNT_NO",
+                }
+                _kis = create_kis_client(selected_mode)
+                if _kis is None:
+                    raise RuntimeError(
+                        f"KIS {selected_mode} 클라이언트 초기화 실패. "
+                        f".env 파일에 {env_hints.get(selected_mode, '인증정보')} 를 설정하세요."
+                    )
+                _bal = _kis.get_balance()
+                if "error" in _bal:
+                    raise RuntimeError(f"KIS 잔고 조회 실패: {_bal['error']}")
+                positions = [
+                    Position(
+                        symbol=item["symbol"],
+                        name=item["name"],
+                        quantity=item["quantity"],
+                        avg_price=item["avg_price"],
+                        current_price=item["current_price"],
+                    )
+                    for item in (_bal.get("positions") or [])
+                ]
+                broker_type = "KisMockBroker" if selected_mode == "mock" else "KisRealBroker"
+                # 현재가 새로고침용 KIS 클라이언트 저장 (현재가 업데이트 버튼에서 재사용)
+                st.session_state["_sell_kis_client"] = _kis
+
             st.session_state["positions"] = positions
             st.session_state["broker_type"] = broker_type
-            if selected_mode != "dry_run":
-                st.success(f"조회 완료: {len(positions)}종목 (브로커: {broker_type})")
+            label = {"KisMockBroker": "KIS 모의투자", "KisRealBroker": "KIS 실전투자",
+                     "DryRunBroker": "가상(드라이런)"}.get(broker_type, broker_type)
+            st.success(f"조회 완료: {len(positions)}종목 ({label})")
         except RuntimeError as exc:
             st.error(f"오류: {exc}")
         except Exception as exc:
@@ -255,6 +298,14 @@ has_positions = bool(positions)
 
 
 def _get_or_create_broker():
+    # real 모드: runtime_real_mode가 변경될 수 있으므로 항상 새로 생성
+    if selected_mode == "real":
+        cfg = get_config()
+        return create_broker(
+            cfg=cfg, mode="real",
+            confirm_text=confirm_text,
+            runtime_real_mode=_runtime_real_mode,
+        )
     broker = st.session_state.get("sell_broker")
     if broker is None:
         cfg = get_config()
