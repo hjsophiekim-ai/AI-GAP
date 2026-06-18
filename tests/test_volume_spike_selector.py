@@ -1,15 +1,19 @@
 """
-Tests for VolumeSpikeSelector — change_rate 5~15% 필터 검증.
+Tests for VolumeSpikeSelector — change_rate 3~18% 필터 검증.
 
-8개 테스트:
-  1. change_rate 4.9% 종목 제외
-  2. change_rate 5.0% 종목 통과
+12개 테스트:
+  1. change_rate 2.9% 종목 제외
+  2. change_rate 3.0% 종목 통과
   3. change_rate 10.0% 종목이 가장 높은 change_rate_score(8)를 받는지
-  4. change_rate 15.0% 종목 통과
-  5. change_rate 15.1% 종목 제외
-  6. Top10 부족 시에도 5% 미만 종목은 fallback 복구 금지
-  7. Top10 부족 시에도 15% 초과 종목은 fallback 복구 금지
+  4. change_rate 18.0% 종목 통과
+  5. change_rate 18.1% 종목 제외
+  6. Top10 부족 시에도 3% 미만 종목은 fallback 복구 금지
+  7. Top10 부족 시에도 18% 초과 종목은 fallback 복구 금지
   8. Top10 dict에 change_rate_score 컬럼 포함
+  9. 3~5% 구간 점수(+2)가 5~8%(+4), 8~12%(+8)보다 낮아야 한다
+ 10. 가격 1만원 이상 2차 fallback — 10,000~19,999원 종목이 부족 시 포함
+ 11. 1만원 미만 종목은 2차 fallback에서도 절대 포함 안 됨
+ 12. 1만원 완화 fallback이어도 상승률 3~18% 조건은 유지된다
 """
 import pytest
 
@@ -43,8 +47,8 @@ def _make_stock(
 
 
 def _selector_with_cfg(
-    min_cr=5.0,
-    max_cr=15.0,
+    min_cr=3.0,
+    max_cr=18.0,
     target_n=10,
     min_tv=3_000_000_000,
     fallback_tv=1_000_000_000,
@@ -65,24 +69,24 @@ def _selector_with_cfg(
 
 
 # ---------------------------------------------------------------------------
-# 1. 4.9% 종목은 제외
+# 1. 2.9% 종목은 제외
 # ---------------------------------------------------------------------------
 
-def test_change_rate_49_excluded():
+def test_change_rate_29_excluded():
     sel = _selector_with_cfg()
-    stocks = [_make_stock("000001", "테스트A", change_rate=4.9)]
+    stocks = [_make_stock("000001", "테스트A", change_rate=2.9)]
     top10, diag = sel.select(stocks)
     assert diag["excluded_below_5pct"] == 1
     assert not any(s["symbol"] == "000001" for s in top10)
 
 
 # ---------------------------------------------------------------------------
-# 2. 5.0% 종목은 통과
+# 2. 3.0% 종목은 통과
 # ---------------------------------------------------------------------------
 
-def test_change_rate_50_passes():
+def test_change_rate_30_passes():
     sel = _selector_with_cfg()
-    stocks = [_make_stock("000002", "테스트B", change_rate=5.0)]
+    stocks = [_make_stock("000002", "테스트B", change_rate=3.0)]
     top10, diag = sel.select(stocks)
     assert diag["excluded_below_5pct"] == 0
     assert any(s["symbol"] == "000002" for s in top10)
@@ -98,44 +102,45 @@ def test_change_rate_100_highest_score():
 
 
 def test_change_rate_score_ordering():
-    """8~12% 구간이 5~8% 및 12~15% 구간보다 점수가 높아야 한다."""
-    assert _change_rate_score(10.0) > _change_rate_score(6.0)
-    assert _change_rate_score(10.0) > _change_rate_score(13.0)
+    """8~12% 구간이 3~5%, 5~8%, 12~18% 구간보다 점수가 높아야 한다."""
+    assert _change_rate_score(10.0) > _change_rate_score(4.0)   # 8 > 2
+    assert _change_rate_score(10.0) > _change_rate_score(6.0)   # 8 > 4
+    assert _change_rate_score(10.0) > _change_rate_score(15.0)  # 8 > 3
 
 
 # ---------------------------------------------------------------------------
-# 4. 15.0% 종목 통과
+# 4. 18.0% 종목 통과
 # ---------------------------------------------------------------------------
 
-def test_change_rate_150_passes():
+def test_change_rate_180_passes():
     sel = _selector_with_cfg()
-    stocks = [_make_stock("000004", "테스트D", change_rate=15.0)]
+    stocks = [_make_stock("000004", "테스트D", change_rate=18.0)]
     top10, diag = sel.select(stocks)
     assert diag["excluded_above_15pct"] == 0
     assert any(s["symbol"] == "000004" for s in top10)
 
 
 # ---------------------------------------------------------------------------
-# 5. 15.1% 종목 제외
+# 5. 18.1% 종목 제외
 # ---------------------------------------------------------------------------
 
-def test_change_rate_151_excluded():
+def test_change_rate_181_excluded():
     sel = _selector_with_cfg()
-    stocks = [_make_stock("000005", "테스트E", change_rate=15.1)]
+    stocks = [_make_stock("000005", "테스트E", change_rate=18.1)]
     top10, diag = sel.select(stocks)
     assert diag["excluded_above_15pct"] == 1
     assert not any(s["symbol"] == "000005" for s in top10)
 
 
 # ---------------------------------------------------------------------------
-# 6. Top10 부족 시 5% 미만 종목은 fallback 복구 금지
+# 6. Top10 부족 시 3% 미만 종목은 fallback 복구 금지
 # ---------------------------------------------------------------------------
 
-def test_fallback_does_not_recover_below_5pct():
-    """primary pass가 0개여도 4.9% 종목은 fallback에 포함 안 됨."""
+def test_fallback_does_not_recover_below_3pct():
+    """primary pass가 0개여도 2.9% 종목은 fallback에 포함 안 됨."""
     sel = _selector_with_cfg(target_n=10)
     stocks = [
-        _make_stock(f"A{i:03d}", f"종목{i}", change_rate=4.9, trade_value=2_000_000_000)
+        _make_stock(f"A{i:03d}", f"종목{i}", change_rate=2.9, trade_value=2_000_000_000)
         for i in range(5)
     ]
     top10, diag = sel.select(stocks)
@@ -144,14 +149,14 @@ def test_fallback_does_not_recover_below_5pct():
 
 
 # ---------------------------------------------------------------------------
-# 7. Top10 부족 시 15% 초과 종목은 fallback 복구 금지
+# 7. Top10 부족 시 18% 초과 종목은 fallback 복구 금지
 # ---------------------------------------------------------------------------
 
-def test_fallback_does_not_recover_above_15pct():
-    """primary pass가 0개여도 15.1% 종목은 fallback에 포함 안 됨."""
+def test_fallback_does_not_recover_above_18pct():
+    """primary pass가 0개여도 18.5% 종목은 fallback에 포함 안 됨."""
     sel = _selector_with_cfg(target_n=10)
     stocks = [
-        _make_stock(f"B{i:03d}", f"종목{i}", change_rate=15.5, trade_value=2_000_000_000)
+        _make_stock(f"B{i:03d}", f"종목{i}", change_rate=18.5, trade_value=2_000_000_000)
         for i in range(5)
     ]
     top10, diag = sel.select(stocks)
@@ -173,7 +178,18 @@ def test_top10_dict_has_change_rate_score():
 
 
 # ---------------------------------------------------------------------------
-# 9. 가격 1만원 이상 2차 fallback — 10,000~19,999원 종목이 부족 시 포함
+# 9. 3~5% 구간 점수(+2)가 다른 구간보다 낮아야 한다
+# ---------------------------------------------------------------------------
+
+def test_change_rate_score_low_band():
+    """3~5% 구간은 +2로 5~8%(+4), 8~12%(+8)보다 낮다."""
+    assert _change_rate_score(4.0) == 2.0
+    assert _change_rate_score(4.0) < _change_rate_score(6.0)
+    assert _change_rate_score(4.0) < _change_rate_score(10.0)
+
+
+# ---------------------------------------------------------------------------
+# 10. 가격 1만원 이상 2차 fallback — 10,000~19,999원 종목이 부족 시 포함
 # ---------------------------------------------------------------------------
 
 def _selector_with_price_relaxed(target_n=10, min_price=20_000, fallback_min_price=10_000,
@@ -184,8 +200,8 @@ def _selector_with_price_relaxed(target_n=10, min_price=20_000, fallback_min_pri
         "target_top_n": target_n,
         "min_price": min_price,
         "fallback_min_price": fallback_min_price,
-        "min_change_rate": 5.0,
-        "max_change_rate": 15.0,
+        "min_change_rate": 3.0,
+        "max_change_rate": 18.0,
         "min_trading_value": min_tv,
         "fallback_min_trading_value": fallback_tv,
         "max_candidates_to_score": 80,
@@ -221,12 +237,12 @@ def test_price_below_10k_always_excluded():
 
 
 def test_price_relaxed_fallback_still_requires_rate_filter():
-    """1만원 완화 fallback이어도 상승률 5~15% 조건은 유지된다."""
+    """1만원 완화 fallback이어도 상승률 3~18% 조건은 유지된다."""
     sel = _selector_with_price_relaxed(target_n=5)
     stocks = [
-        # 1만원~2만원 but 상승률 3% → 제외
-        _make_stock("D001", "저가저율", change_rate=3.0, trade_value=1_500_000_000, current_price=15_000),
-        # 1만원~2만원 but 상승률 20% → 제외
+        # 1만원~2만원 but 상승률 2% → 제외 (3% 미만)
+        _make_stock("D001", "저가저율", change_rate=2.0, trade_value=1_500_000_000, current_price=15_000),
+        # 1만원~2만원 but 상승률 20% → 제외 (18% 초과)
         _make_stock("D002", "저가고율", change_rate=20.0, trade_value=1_500_000_000, current_price=15_000),
     ]
     top10, diag = sel.select(stocks)

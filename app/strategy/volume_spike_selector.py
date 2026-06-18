@@ -1,16 +1,16 @@
 """
 volume_spike_selector.py
 
-거래량 급증 종목 중 상승률 5%~15% 종목만 후보로 사용하는 Top10 선정기.
+거래량 급증 종목 중 상승률 3%~18% 종목만 후보로 사용하는 Top10 선정기.
 
 필터 순서:
   1. ETF/ETN/우선주/스팩/리츠 제외
   2. 가격 20,000원 이하 제외 (상위 통과)
-  3. 상승률 5% 미만 제외 (하드, fallback 복구 금지)
-  4. 상승률 15% 초과 제외 (하드, fallback 복구 금지)
+  3. 상승률 3% 미만 제외 (하드, fallback 복구 금지)
+  4. 상승률 18% 초과 제외 (하드, fallback 복구 금지)
   5. 거래대금 30억 이상 → primary pass
-  6. Top10 부족 시 거래대금 10억 이상 fallback (5~15% 조건 유지, 가격 20,000원+)
-  7. Top10 여전히 부족 시 가격 10,000원 이상 완화 fallback (5~15% 조건 유지, 거래대금 10억+)
+  6. Top10 부족 시 거래대금 10억 이상 fallback (3~18% 조건 유지, 가격 20,000원+)
+  7. Top10 여전히 부족 시 가격 10,000원 이상 완화 fallback (3~18% 조건 유지, 거래대금 10억+)
   8. 점수 계산 → 내림차순 정렬 → Top10
 """
 from __future__ import annotations
@@ -24,8 +24,8 @@ import pandas as pd
 from app.logger import logger
 
 # 상승률 구간 경계
-_MIN_CHANGE_RATE = 5.0
-_MAX_CHANGE_RATE = 15.0
+_MIN_CHANGE_RATE = 3.0
+_MAX_CHANGE_RATE = 18.0
 
 # 거래대금 기준
 _PRIMARY_MIN_TV = 3_000_000_000   # 30억
@@ -37,14 +37,22 @@ _FALLBACK_MIN_PRICE = 10_000  # 2차 fallback: 1만원 이상
 
 
 def _change_rate_score(rate: float) -> Optional[float]:
-    """상승률 구간별 점수. 범위 밖이면 None(하드 제외 처리)."""
+    """상승률 구간별 점수. 범위 밖이면 None(하드 제외 처리).
+
+    3~5%:  +2  (수급 진입 구간)
+    5~8%:  +4  (안정 수급)
+    8~12%: +8  (강한 수급, 최선호)
+    12~18%: +3 (강하지만 단기 과열 가능성)
+    """
     if rate < _MIN_CHANGE_RATE or rate > _MAX_CHANGE_RATE:
         return None
+    if rate < 5.0:
+        return 2.0   # 3~5%: 수급 진입 구간
     if rate < 8.0:
         return 4.0   # 5~8%: 안정 수급
     if rate <= 12.0:
         return 8.0   # 8~12%: 강한 수급 (선호)
-    return 3.0       # 12~15%: 과열 가능성
+    return 3.0       # 12~18%: 과열 가능성
 
 
 def _trading_value_score(tv: float) -> float:
@@ -161,7 +169,7 @@ class VolumeSpikeSelector:
             else:
                 after_price.append(s)
 
-        # ── Stage 3: 상승률 하드 필터 (5% 미만 / 15% 초과 모두 제외) ────────
+        # ── Stage 3: 상승률 하드 필터 (3% 미만 / 18% 초과 모두 제외) ────────
         # 상승률 조건은 주 후보 + fallback 후보 모두에 동일 적용
         def _apply_rate_filter(pool: list[dict]) -> tuple[list[dict], int, int]:
             passed, below, above = [], 0, 0
@@ -240,7 +248,7 @@ class VolumeSpikeSelector:
         diag["final_top10"] = len(top)
 
         logger.info(
-            "[VolumeSpikeSelector] 전체 %d → 5%%미만제외 %d → 15%%초과제외 %d "
+            "[VolumeSpikeSelector] 전체 %d → 3%%미만제외 %d → 18%%초과제외 %d "
             "→ 통과 %d → 30억이상 %d → fallback1 %d → fallback2(1만원완화) %d → 최종 %d",
             diag["total"],
             diag["excluded_below_5pct"],
