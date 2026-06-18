@@ -170,3 +170,65 @@ def test_top10_dict_has_change_rate_score():
     assert top10, "선정 결과 없음"
     assert "change_rate_score" in top10[0]
     assert top10[0]["change_rate_score"] == 8.0  # 8~12% 구간
+
+
+# ---------------------------------------------------------------------------
+# 9. 가격 1만원 이상 2차 fallback — 10,000~19,999원 종목이 부족 시 포함
+# ---------------------------------------------------------------------------
+
+def _selector_with_price_relaxed(target_n=10, min_price=20_000, fallback_min_price=10_000,
+                                  min_tv=3_000_000_000, fallback_tv=1_000_000_000):
+    sel = VolumeSpikeSelector.__new__(VolumeSpikeSelector)
+    sel.cfg = None
+    sel._vs_cfg = {
+        "target_top_n": target_n,
+        "min_price": min_price,
+        "fallback_min_price": fallback_min_price,
+        "min_change_rate": 5.0,
+        "max_change_rate": 15.0,
+        "min_trading_value": min_tv,
+        "fallback_min_trading_value": fallback_tv,
+        "max_candidates_to_score": 80,
+    }
+    return sel
+
+
+def test_price_relaxed_fallback_includes_10k_stocks():
+    """primary+fallback1이 부족하면 1만원 이상 종목이 2차 fallback으로 포함된다."""
+    sel = _selector_with_price_relaxed(target_n=3)
+    stocks = [
+        # 2만원+ → primary (30억 이상)
+        _make_stock("A001", "정상종목", change_rate=9.0, trade_value=5_000_000_000, current_price=50_000),
+        # 1만원~2만원 구간 → 가격 완화 fallback 후보
+        _make_stock("B001", "저가종목1", change_rate=8.0, trade_value=2_000_000_000, current_price=15_000),
+        _make_stock("B002", "저가종목2", change_rate=7.0, trade_value=1_500_000_000, current_price=12_000),
+    ]
+    top10, diag = sel.select(stocks)
+    assert diag["price_relaxed_added"] > 0, "2차 fallback이 적용되어야 함"
+    symbols = {s["symbol"] for s in top10}
+    assert "B001" in symbols or "B002" in symbols, "1만원~2만원 종목이 포함되어야 함"
+
+
+def test_price_below_10k_always_excluded():
+    """1만원 미만 종목은 2차 fallback에서도 절대 포함 안 됨."""
+    sel = _selector_with_price_relaxed(target_n=5)
+    stocks = [
+        _make_stock("C001", "초저가", change_rate=9.0, trade_value=5_000_000_000, current_price=8_000),
+    ]
+    top10, diag = sel.select(stocks)
+    assert diag["excluded_price"] == 1
+    assert not any(s["symbol"] == "C001" for s in top10)
+
+
+def test_price_relaxed_fallback_still_requires_rate_filter():
+    """1만원 완화 fallback이어도 상승률 5~15% 조건은 유지된다."""
+    sel = _selector_with_price_relaxed(target_n=5)
+    stocks = [
+        # 1만원~2만원 but 상승률 3% → 제외
+        _make_stock("D001", "저가저율", change_rate=3.0, trade_value=1_500_000_000, current_price=15_000),
+        # 1만원~2만원 but 상승률 20% → 제외
+        _make_stock("D002", "저가고율", change_rate=20.0, trade_value=1_500_000_000, current_price=15_000),
+    ]
+    top10, diag = sel.select(stocks)
+    assert diag["final_top10"] == 0
+    assert diag["price_relaxed_added"] == 0

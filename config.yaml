@@ -110,7 +110,8 @@ volume_spike:
   min_change_rate: 5.0            # 상승률 5% 미만 제외 (하드, fallback 복구 금지)
   max_change_rate: 15.0           # 상승률 15% 초과 제외 (하드, fallback 복구 금지)
   min_trading_value: 3000000000   # 거래대금 30억 이상 1차 통과
-  fallback_min_trading_value: 1000000000  # fallback 10억 이상 (5~15% 조건 유지)
+  fallback_min_trading_value: 1000000000  # fallback1: 거래대금 10억 이상 (5~15% 조건 유지)
+  fallback_min_price: 10000               # fallback2: Top10 부족 시 1만원 이상으로 가격 완화
   exclude_etf: true
   exclude_etn: true
   exclude_preferred: true

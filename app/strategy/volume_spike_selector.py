@@ -5,12 +5,13 @@ volume_spike_selector.py
 
 필터 순서:
   1. ETF/ETN/우선주/스팩/리츠 제외
-  2. 가격 20,000원 이하 제외
+  2. 가격 20,000원 이하 제외 (상위 통과)
   3. 상승률 5% 미만 제외 (하드, fallback 복구 금지)
   4. 상승률 15% 초과 제외 (하드, fallback 복구 금지)
   5. 거래대금 30억 이상 → primary pass
-  6. Top10 부족 시 거래대금 10억 이상 fallback (5~15% 조건 유지)
-  7. 점수 계산 → 내림차순 정렬 → Top10
+  6. Top10 부족 시 거래대금 10억 이상 fallback (5~15% 조건 유지, 가격 20,000원+)
+  7. Top10 여전히 부족 시 가격 10,000원 이상 완화 fallback (5~15% 조건 유지, 거래대금 10억+)
+  8. 점수 계산 → 내림차순 정렬 → Top10
 """
 from __future__ import annotations
 
@@ -32,6 +33,7 @@ _FALLBACK_MIN_TV = 1_000_000_000  # 10억
 
 # 최소 주가
 _MIN_PRICE = 20_000
+_FALLBACK_MIN_PRICE = 10_000  # 2차 fallback: 1만원 이상
 
 
 def _change_rate_score(rate: float) -> Optional[float]:
@@ -107,23 +109,25 @@ class VolumeSpikeSelector:
           diag: dict         — 진단 정보
         """
         vs = self._vs_cfg
-        target_n    = int(vs.get("target_top_n", 10))
-        min_price   = float(vs.get("min_price", _MIN_PRICE))
-        min_cr      = float(vs.get("min_change_rate", _MIN_CHANGE_RATE))
-        max_cr      = float(vs.get("max_change_rate", _MAX_CHANGE_RATE))
-        min_tv      = float(vs.get("min_trading_value", _PRIMARY_MIN_TV))
-        fallback_tv = float(vs.get("fallback_min_trading_value", _FALLBACK_MIN_TV))
-        max_cands   = int(vs.get("max_candidates_to_score", 80))
+        target_n         = int(vs.get("target_top_n", 10))
+        min_price        = float(vs.get("min_price", _MIN_PRICE))
+        fallback_min_price = float(vs.get("fallback_min_price", _FALLBACK_MIN_PRICE))
+        min_cr           = float(vs.get("min_change_rate", _MIN_CHANGE_RATE))
+        max_cr           = float(vs.get("max_change_rate", _MAX_CHANGE_RATE))
+        min_tv           = float(vs.get("min_trading_value", _PRIMARY_MIN_TV))
+        fallback_tv      = float(vs.get("fallback_min_trading_value", _FALLBACK_MIN_TV))
+        max_cands        = int(vs.get("max_candidates_to_score", 80))
 
         diag: dict = {
             "total": 0,
             "excluded_type": 0,
-            "excluded_price": 0,
+            "excluded_price": 0,        # 1만원 미만 (항상 제외)
             "excluded_below_5pct": 0,
             "excluded_above_15pct": 0,
             "passed_rate_filter": 0,
             "primary_pass": 0,
-            "fallback_added": 0,
+            "fallback_added": 0,         # 거래대금 완화 fallback
+            "price_relaxed_added": 0,    # 가격 1만원 완화 2차 fallback
             "final_top10": 0,
         }
         excluded_records: list[dict] = []
@@ -141,28 +145,47 @@ class VolumeSpikeSelector:
                 after_type.append(s)
 
         # ── Stage 2: 가격 필터 ─────────────────────────────────────────────
-        after_price: list[dict] = []
+        # 20,000원 이상: 주 후보
+        # 10,000원 이상 20,000원 미만: 2차 fallback 후보
+        # 10,000원 미만: 항상 제외
+        after_price: list[dict] = []          # 20,000원+
+        price_relaxed_pool: list[dict] = []   # 10,000원~19,999원 (2차 fallback 전용)
         for s in after_type:
-            if s.get("current_price", 0) <= min_price:
+            price = s.get("current_price", 0)
+            if price <= fallback_min_price:
                 diag["excluded_price"] += 1
-                excluded_records.append({**s, "excluded_reason": "price_below_20k"})
+                excluded_records.append({**s, "excluded_reason": "price_below_10k"})
+            elif price <= min_price:
+                # 1만원~2만원: 2차 fallback 후보
+                price_relaxed_pool.append(s)
             else:
                 after_price.append(s)
 
         # ── Stage 3: 상승률 하드 필터 (5% 미만 / 15% 초과 모두 제외) ────────
-        after_rate: list[dict] = []
-        for s in after_price:
-            cr = s.get("change_rate", 0.0)
-            if cr < min_cr:
-                diag["excluded_below_5pct"] += 1
-                excluded_records.append({**s, "excluded_reason": "change_rate_below_5"})
-            elif cr > max_cr:
-                diag["excluded_above_15pct"] += 1
-                excluded_records.append({**s, "excluded_reason": "change_rate_above_15"})
-            else:
-                after_rate.append(s)
+        # 상승률 조건은 주 후보 + fallback 후보 모두에 동일 적용
+        def _apply_rate_filter(pool: list[dict]) -> tuple[list[dict], int, int]:
+            passed, below, above = [], 0, 0
+            for s in pool:
+                cr = s.get("change_rate", 0.0)
+                if cr < min_cr:
+                    below += 1
+                    excluded_records.append({**s, "excluded_reason": "change_rate_below_5"})
+                elif cr > max_cr:
+                    above += 1
+                    excluded_records.append({**s, "excluded_reason": "change_rate_above_15"})
+                else:
+                    passed.append(s)
+            return passed, below, above
 
+        after_rate, b5, a15 = _apply_rate_filter(after_price)
+        diag["excluded_below_5pct"] += b5
+        diag["excluded_above_15pct"] += a15
         diag["passed_rate_filter"] = len(after_rate)
+
+        # 2차 fallback 후보도 상승률 필터 적용
+        price_rel_after_rate, b5r, a15r = _apply_rate_filter(price_relaxed_pool)
+        diag["excluded_below_5pct"] += b5r
+        diag["excluded_above_15pct"] += a15r
 
         # ── Stage 4: 거래대금 1차 (30억 이상) ─────────────────────────────
         primary: list[dict] = [
@@ -173,41 +196,59 @@ class VolumeSpikeSelector:
         # ── Stage 5: 점수 정렬 ────────────────────────────────────────────
         primary_scored = sorted(primary, key=lambda s: _score(s), reverse=True)
 
-        # ── Stage 6: fallback (30억 미달 but 10억 이상, 5~15% 조건 유지) ──
+        # ── Stage 6: fallback1 (거래대금 10억~30억, 가격 20,000원+) ────────
         if len(primary_scored) < target_n:
-            in_primary = {s["symbol"] for s in primary_scored}
-            fallback_pool = [
+            in_sel = {s["symbol"] for s in primary_scored}
+            fb1_pool = [
                 s for s in after_rate
-                if s["symbol"] not in in_primary
+                if s["symbol"] not in in_sel
                 and s.get("trade_value", 0) >= fallback_tv
             ]
-            fallback_sorted = sorted(fallback_pool, key=lambda s: _score(s), reverse=True)
+            fb1_sorted = sorted(fb1_pool, key=lambda s: _score(s), reverse=True)
             need = target_n - len(primary_scored)
-            added = fallback_sorted[:need]
+            added = fb1_sorted[:need]
             diag["fallback_added"] = len(added)
             primary_scored = primary_scored + added
         else:
             diag["fallback_added"] = 0
 
-        # ── Stage 7: Top N ────────────────────────────────────────────────
+        # ── Stage 7: fallback2 (가격 10,000원~19,999원 완화, 거래대금 10억+) ──
+        if len(primary_scored) < target_n:
+            in_sel2 = {s["symbol"] for s in primary_scored}
+            fb2_pool = [
+                s for s in price_rel_after_rate
+                if s["symbol"] not in in_sel2
+                and s.get("trade_value", 0) >= fallback_tv
+            ]
+            fb2_sorted = sorted(fb2_pool, key=lambda s: _score(s), reverse=True)
+            need2 = target_n - len(primary_scored)
+            added2 = fb2_sorted[:need2]
+            diag["price_relaxed_added"] = len(added2)
+            primary_scored = primary_scored + added2
+        else:
+            diag["price_relaxed_added"] = 0
+
+        # ── Stage 8: Top N ────────────────────────────────────────────────
         top = primary_scored[:target_n]
         for i, s in enumerate(top, 1):
             s["rank"] = i
             cr = s.get("change_rate", 0.0)
             s["change_rate_score"] = _change_rate_score(cr) or 0.0
             s["final_score"] = _score(s)
+            s["price_relaxed"] = s.get("current_price", 0) <= min_price
 
         diag["final_top10"] = len(top)
 
         logger.info(
             "[VolumeSpikeSelector] 전체 %d → 5%%미만제외 %d → 15%%초과제외 %d "
-            "→ 통과 %d → 30억이상 %d → fallback %d → 최종 %d",
+            "→ 통과 %d → 30억이상 %d → fallback1 %d → fallback2(1만원완화) %d → 최종 %d",
             diag["total"],
             diag["excluded_below_5pct"],
             diag["excluded_above_15pct"],
             diag["passed_rate_filter"],
             diag["primary_pass"],
             diag["fallback_added"],
+            diag["price_relaxed_added"],
             diag["final_top10"],
         )
 

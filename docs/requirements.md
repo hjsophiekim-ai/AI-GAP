@@ -32,6 +32,69 @@
 
 AI-GAP(AI-Guided Automated Portfolio)은 한국 주식시장에서 머신러닝 기반의 종목 선정과 자동화된 매매를 수행하는 시스템이다. 매일 장 시작 전 상위 후보 종목을 선정하고, 장중 자동 매수·매도를 실행하여 수익을 추구한다.
 
+### 1.5 거래량 급증 전략 (Volume Spike Strategy)
+
+갭상승 전략 외에 **거래량 급증 종목 기반 Top10 전략**을 제공한다.
+
+#### 1.5.1 기본 원칙
+
+- 기본 전략: 네이버 거래량 급증 종목 페이지 (`https://finance.naver.com/sise/sise_quant_high.naver`) 수집
+- 수집 종목 중 **당일 상승률 5% 이상 15% 이하 종목만** 최종 후보로 사용
+- 5% 미만 상승: 매수 탄력(수급 탄력) 부족으로 제외
+- 15% 초과 상승: 추격매수 위험으로 제외
+- **상승률 조건을 벗어난 종목은 Top10 부족 시에도 fallback 복구 금지**
+
+#### 1.5.2 필터 순서
+
+| 순서 | 조건 | 비고 |
+|------|------|------|
+| 1 | ETF/ETN/KODEX/TIGER/ACE/SOL 등 제외 | 이름 키워드 + 플래그 |
+| 2 | 우선주/스팩/리츠 제외 | |
+| 3 | 거래정지/관리종목/정리매매 제외 | |
+| 4 | 현재가 20,000원 이하 제외 (primary 기준) | |
+| 5 | **상승률 5% 미만 제외** (하드 필터, fallback 복구 금지) | excluded_reason: change_rate_below_5 |
+| 6 | **상승률 15% 초과 제외** (하드 필터, fallback 복구 금지) | excluded_reason: change_rate_above_15 |
+| 7 | 거래대금 30억 이상 → 1차 통과 | primary pass |
+| 8 | Top10 부족 시 거래대금 10억 이상 fallback1 (가격 20,000원+, 5~15% 유지) | |
+| 9 | Top10 여전히 부족 시 가격 10,000원 이상 fallback2 (거래대금 10억+, 5~15% 유지) | price_relaxed |
+
+#### 1.5.3 점수화 (change_rate_score)
+
+```
+final_score = base(5) + change_rate_score + trading_value_score
+```
+
+| 상승률 구간 | change_rate_score | 해석 |
+|------------|-------------------|------|
+| 5% 이상 8% 미만 | +4 | 안정적인 수급 구간 |
+| 8% 이상 12% 이하 | +8 | 최선호 강한 수급 구간 |
+| 12% 초과 15% 이하 | +3 | 강하지만 단기 과열 가능성 |
+| 5% 미만 또는 15% 초과 | 하드 제외 | — |
+
+#### 1.5.4 fallback 조건 상세
+
+**fallback1 (거래대금 완화)**:
+- 현재가 20,000원 초과
+- 상승률 5% 이상 15% 이하
+- 거래대금 10억 이상
+
+**fallback2 (가격 완화, 1만원 이상)**:
+- 현재가 10,000원 이상 (20,000원 미만 포함)
+- 상승률 5% 이상 15% 이하
+- 거래대금 10억 이상
+
+**절대 복구 금지 (fallback에서도 제외)**:
+- 상승률 5% 미만 또는 15% 초과
+- 현재가 10,000원 이하
+- ETF/ETN/우선주/스팩/리츠/거래정지/관리종목/정리매매
+
+#### 1.5.5 CSV 출력
+
+- Top10 CSV: `data/volume_spike/YYYYMMDD_volume_spike_top10.csv`
+  - 컬럼: rank, symbol, name, current_price, change_rate, **change_rate_score**, trade_value, final_score
+- 제외 CSV: `data/volume_spike/YYYYMMDD_volume_spike_excluded.csv`
+  - excluded_reason: `change_rate_below_5` / `change_rate_above_15` / `price_below_10k` / `etf_etn_or_type`
+
 ### 1.2 적용 시장
 
 - 한국거래소(KRX) 코스피(KOSPI) 및 코스닥(KOSDAQ)

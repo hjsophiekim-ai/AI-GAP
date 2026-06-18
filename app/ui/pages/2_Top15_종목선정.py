@@ -512,7 +512,8 @@ if st.button("거래량급증 Top10 선정하기", key="btn_volume_spike", use_c
             _vs_log(f"  5% 미만 제외: {diag['excluded_below_5pct']}개")
             _vs_log(f"  15% 초과 제외: {diag['excluded_above_15pct']}개")
             _vs_log(f"  상승률 조건 통과: {diag['passed_rate_filter']}개")
-            _vs_log(f"  fallback 추가: {diag['fallback_added']}개")
+            _vs_log(f"  거래대금 fallback 추가: {diag['fallback_added']}개")
+            _vs_log(f"  가격완화(1만원+) fallback: {diag.get('price_relaxed_added', 0)}개")
             _vs_log(f"  최종 Top10: {diag['final_top10']}개")
 
             # STEP 3: CSV 저장
@@ -545,11 +546,12 @@ if st.session_state.get("volume_spike_top10"):
         st.caption(f"선정 시각: {at}")
 
     # 진단 정보
-    d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+    d_col1, d_col2, d_col3, d_col4, d_col5 = st.columns(5)
     d_col1.metric("5% 미만 제외", f"{diag.get('excluded_below_5pct', 0)}개")
     d_col2.metric("15% 초과 제외", f"{diag.get('excluded_above_15pct', 0)}개")
     d_col3.metric("상승률 조건 통과", f"{diag.get('passed_rate_filter', 0)}개")
-    d_col4.metric("최종 Top10", f"{diag.get('final_top10', 0)}개")
+    d_col4.metric("가격완화 fallback", f"{diag.get('price_relaxed_added', 0)}개")
+    d_col5.metric("최종 Top10", f"{diag.get('final_top10', 0)}개")
 
     # 결과 테이블
     vs_rows = []
