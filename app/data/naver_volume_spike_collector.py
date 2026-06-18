@@ -95,7 +95,22 @@ def _detect_type(name: str) -> dict:
 
 
 def _parse_row(row, date_str: str = "") -> Optional[dict]:
-    """sise_quant_high.naver <tr> 한 행 파싱."""
+    """
+    sise_quant_high.naver <tr> 한 행 파싱.
+
+    실제 테이블 컬럼 구조 (11컬럼):
+      col[0]: 순위
+      col[1]: 전일거래량비(배)
+      col[2]: 종목명 (a 태그 포함)
+      col[3]: 현재가
+      col[4]: 전일비
+      col[5]: 등락률(%)
+      col[6]: 시가
+      col[7]: 고가
+      col[8]: 거래량
+      col[9]: 거래대금(백만원)
+      col[10]: 전일거래량
+    """
     try:
         name_tag = row.find("a")
         if not name_tag:
@@ -108,25 +123,21 @@ def _parse_row(row, date_str: str = "") -> Optional[dict]:
         symbol = m.group(1)
 
         cols = row.find_all("td")
-        if len(cols) < 5:
+        if len(cols) < 10:
             return None
 
         def txt(i: int) -> str:
             return cols[i].get_text(strip=True) if i < len(cols) else ""
 
-        current_price = _safe_float(txt(1))
+        current_price = _safe_float(txt(3))
         if current_price <= 0:
             return None
 
-        # 등락률: 컬럼 위치가 페이지마다 다를 수 있어 3번 또는 4번 시도
-        change_rate_raw = txt(3)
-        change_rate = _safe_float(change_rate_raw)
+        change_rate = _safe_float(txt(5))  # 등락률(%) — "+30.00%" → 30.0
+        volume = _safe_int(txt(8))          # 거래량
 
-        volume = _safe_int(txt(4))
-
-        # 거래대금(백만원) — 마지막 컬럼
-        trade_value_m = _safe_float(txt(len(cols) - 1))
-        trade_value = trade_value_m * 1_000_000  # 백만원 → 원
+        # 거래대금: col[9] = 백만원 단위
+        trade_value = _safe_float(txt(9)) * 1_000_000
 
         type_flags = _detect_type(name)
 

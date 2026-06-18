@@ -4,7 +4,7 @@ from typing import Optional
 from app.logger import logger
 from app.config import get_config
 from app.models import StockData
-from app.data.naver_gap_collector import NaverGapCollector
+from app.data.naver_volume_spike_collector import collect_volume_spike_stocks
 from app.data.kis_market_data import KISMarketData
 from app.data.sample_data import generate_sample_gap_stocks
 
@@ -27,7 +27,6 @@ def is_pre_market() -> bool:
 class DataCollector:
     def __init__(self, cfg=None):
         self.cfg = cfg or get_config()
-        self._naver = NaverGapCollector()
         self._kis: Optional[KISMarketData] = None
 
         kis_cfg = self.cfg._raw.get("kis", {})
@@ -85,17 +84,17 @@ class DataCollector:
         used_source: str = "unknown"
         is_sample = False
 
-        # ── 1차: Naver 갭상승 ───────────────────────────────────────────
+        # ── 1차: Naver 거래량급증 (sise_quant_high.naver) ──────────────
         try:
-            raw_list = self._naver.collect_gap_stocks(date_str=date_str)
+            raw_list = collect_volume_spike_stocks(max_pages=3, max_stocks=80)
             if raw_list and len(raw_list) >= 5:
-                used_source = "naver"
-                logger.info(f"[DataCollector] Naver에서 {len(raw_list)}개 수집")
+                used_source = "naver_volume_spike"
+                logger.info(f"[DataCollector] 거래량급증에서 {len(raw_list)}개 수집")
             else:
-                logger.warning(f"[DataCollector] Naver 결과 부족({len(raw_list)}개)")
+                logger.warning(f"[DataCollector] 거래량급증 결과 부족({len(raw_list)}개)")
                 raw_list = []
         except Exception as e:
-            logger.warning(f"[DataCollector] Naver 수집 오류: {e}")
+            logger.warning(f"[DataCollector] 거래량급증 수집 오류: {e}")
             raw_list = []
 
         # ── 2차: KIS (있을 경우) ────────────────────────────────────────
@@ -231,14 +230,8 @@ class DataCollector:
             except Exception as e:
                 logger.warning(f"[DataCollector] KIS 현재가 조회 실패: {e} → Naver 시도")
 
-        # Try Naver as fallback
-        try:
-            prices = self._naver.get_current_prices(symbols)
-            if prices:
-                logger.debug(f"[DataCollector] Naver 현재가 조회: {len(prices)}개")
-                return prices
-        except Exception as e:
-            logger.warning(f"[DataCollector] Naver 현재가 조회 실패: {e}")
+        # Naver 현재가 조회는 별도 구현 시 추가 (현재는 KIS 전용)
+
 
         logger.warning(f"[DataCollector] 현재가 조회 전체 실패 — 빈 dict 반환")
         return {}
