@@ -10,7 +10,20 @@ class BudgetAllocator:
     def __init__(self, cfg=None):
         self.cfg = cfg or get_config()
 
-    def allocate(self, candidates: list, total_budget: float = None, max_shares: int = None) -> list:
+    def allocate(
+        self,
+        candidates: list,
+        total_budget: float = None,
+        max_shares: int = None,
+        target_n: int = 10,
+    ) -> list:
+        """예산 배분.
+
+        Phase 1 — 균등 배분 (max_shares 상한, 라운드 로빈)
+        Phase 2 — 잔여 예산 추가 배분:
+            선택 종목이 target_n(기본 10개)보다 적을 때 활성화.
+            순위 높은 종목부터 1주씩 순환 추가하여 잔여 예산을 최대한 소진.
+        """
         trading = self.cfg.trading
 
         if total_budget is None:
@@ -21,7 +34,8 @@ class BudgetAllocator:
         remaining_budget = total_budget
         allocations = {c.symbol: 0 for c in candidates}
 
-        for round_num in range(1, max_shares + 1):
+        # ── Phase 1: 균등 배분 (max_shares 상한) ─────────────────────────────
+        for _round in range(1, max_shares + 1):
             for candidate in candidates:
                 symbol = candidate.symbol
                 price = candidate.current_price
@@ -32,6 +46,29 @@ class BudgetAllocator:
                 allocations[symbol] += 1
                 remaining_budget -= price
 
+        # ── Phase 2: 잔여 예산 추가 배분 (종목 부족 시) ──────────────────────
+        # 선택 종목이 target_n보다 적을 때: 순위 높은 종목부터 1주씩 순환 매수
+        if candidates and len(candidates) < target_n and remaining_budget > 0:
+            by_rank = sorted(candidates, key=lambda c: c.rank)
+            min_price = min(c.current_price for c in by_rank)
+            logger.info(
+                "Phase2 추가배분 시작: 종목 %d개 < 목표 %d개, 잔여예산 %s원",
+                len(candidates), target_n, f"{remaining_budget:,.0f}",
+            )
+            while remaining_budget >= min_price:
+                added = False
+                for c in by_rank:
+                    if c.current_price <= remaining_budget:
+                        allocations[c.symbol] += 1
+                        remaining_budget -= c.current_price
+                        added = True
+                if not added:
+                    break
+            logger.info(
+                "Phase2 추가배분 완료: 잔여예산 %s원", f"{remaining_budget:,.0f}"
+            )
+
+        # ── 배분 계획 생성 ────────────────────────────────────────────────────
         plans = []
         cumulative_used = 0.0
         for candidate in candidates:
@@ -58,9 +95,9 @@ class BudgetAllocator:
 
         total_used = total_budget - remaining_budget
         logger.info(
-            f"예산배분 완료: {len(plans)}개 종목, 총 {total_used:,.0f}원 사용, 잔여 {remaining_budget:,.0f}원"
+            "예산배분 완료: %d개 종목, 총 %s원 사용, 잔여 %s원",
+            len(plans), f"{total_used:,.0f}", f"{remaining_budget:,.0f}",
         )
-
         return plans
 
     def save_buy_plan(self, plans: list, date_str: str = None) -> str:
