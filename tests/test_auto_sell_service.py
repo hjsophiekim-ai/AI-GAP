@@ -83,6 +83,7 @@ def _make_service(
     svc._first_tp_rate = 3.0
     svc._first_tp_ratio = 0.5
     svc._final_tp_rate = 5.0
+    svc._stop_loss_rate = -2.0
     svc._order_type = "market"
     svc._market_start = "00:00"
     svc._market_end = "23:59"
@@ -322,6 +323,84 @@ def test_pending_order_blocks_new_order(tmp_path):
     svc = _make_service(current_price=73500.0, tmp_path=tmp_path)
     svc.state["005930"] = AutoSellService._new_state("삼성전자", 70000.0)
     svc.state["005930"]["pending_order"] = True
+
+    results = svc.run_once()
+    assert results == []
+    svc._broker.sell.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 12. 손절 조건: -2% 이하 → should_stop_loss True
+# ---------------------------------------------------------------------------
+
+def test_should_stop_loss_triggers_at_threshold():
+    """수익률이 -2.0% 이하이면 손절 조건 충족."""
+    svc = _make_service()
+    state = {"stop_loss_executed": False, "all_sold": False}
+    assert svc.should_stop_loss({"profit_rate": -2.0}, state)
+    assert svc.should_stop_loss({"profit_rate": -2.5}, state)
+    assert not svc.should_stop_loss({"profit_rate": -1.99}, state)
+
+
+def test_should_stop_loss_false_if_already_executed():
+    """stop_loss_executed=True이면 손절 조건 false."""
+    svc = _make_service()
+    state = {"stop_loss_executed": True, "all_sold": False}
+    assert not svc.should_stop_loss({"profit_rate": -3.0}, state)
+
+
+def test_should_stop_loss_false_if_all_sold():
+    """all_sold=True이면 손절 조건 false."""
+    svc = _make_service()
+    state = {"stop_loss_executed": False, "all_sold": True}
+    assert not svc.should_stop_loss({"profit_rate": -3.0}, state)
+
+
+# ---------------------------------------------------------------------------
+# 13. execute_stop_loss: 성공 시 state 업데이트
+# ---------------------------------------------------------------------------
+
+def test_execute_stop_loss_success(tmp_path):
+    """손절매도 성공 시 stop_loss_executed=True, all_sold=True."""
+    svc = _make_service(current_price=68600.0, tmp_path=tmp_path)  # -2.0%
+    pos = {"symbol": "005930", "name": "삼성전자", "quantity": 10,
+           "avg_buy_price": 70000.0, "current_price": 68600.0, "profit_rate": -2.0}
+
+    result = svc.execute_stop_loss(pos, 68600.0)
+
+    assert result["sell_type"] == "stop_loss"
+    assert result["order_result"] == "SUCCESS"
+    assert result["sell_quantity"] == 10
+    assert svc.state["005930"]["stop_loss_executed"] is True
+    assert svc.state["005930"]["all_sold"] is True
+    assert svc.state["005930"]["pending_order"] is False
+
+
+# ---------------------------------------------------------------------------
+# 14. run_once: 손절이 익절보다 우선
+# ---------------------------------------------------------------------------
+
+def test_stop_loss_priority_over_take_profit(tmp_path):
+    """-2% 손절 조건 충족 시 익절 체크 없이 손절 실행."""
+    # avg=70000, price=68600 → -2.0% (손절 조건 충족; 익절 조건 미충족)
+    svc = _make_service(current_price=68600.0, tmp_path=tmp_path)
+    results = svc.run_once()
+
+    assert len(results) == 1
+    assert results[0]["sell_type"] == "stop_loss"
+    assert svc.state["005930"]["stop_loss_executed"] is True
+
+
+# ---------------------------------------------------------------------------
+# 15. 손절 후 중복 실행 방지
+# ---------------------------------------------------------------------------
+
+def test_no_duplicate_stop_loss(tmp_path):
+    """stop_loss_executed=True이면 재실행 안 됨."""
+    svc = _make_service(current_price=68600.0, tmp_path=tmp_path)
+    svc.state["005930"] = AutoSellService._new_state("삼성전자", 70000.0)
+    svc.state["005930"]["stop_loss_executed"] = True
+    svc.state["005930"]["all_sold"] = True
 
     results = svc.run_once()
     assert results == []

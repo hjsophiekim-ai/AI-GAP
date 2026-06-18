@@ -56,6 +56,10 @@ class AutoSellService:
             os.getenv("AUTO_SELL_FINAL_TP_RATE",
                       auto_cfg.get("final_take_profit_rate", 5.0))
         )
+        self._stop_loss_rate: float = float(
+            os.getenv("AUTO_SELL_STOP_LOSS_RATE",
+                      auto_cfg.get("stop_loss_rate", -2.0))
+        )
         self._order_type: str = auto_cfg.get("order_type", "market")
         self._market_start: str = auto_cfg.get("market_start", "09:00")
         self._market_end: str = auto_cfg.get("market_end", "15:20")
@@ -149,6 +153,18 @@ class AutoSellService:
         """
         return (
             position.get("profit_rate", 0.0) >= self._final_tp_rate
+            and not state.get("all_sold", False)
+        )
+
+    def should_stop_loss(self, position: dict, state: dict) -> bool:
+        """손절 조건 충족 여부.
+
+        profit_rate <= stop_loss_rate AND stop_loss_executed is False
+        stop_loss_rate는 음수 (예: -2.0 = -2% 손실)
+        """
+        return (
+            position.get("profit_rate", 0.0) <= self._stop_loss_rate
+            and not state.get("stop_loss_executed", False)
             and not state.get("all_sold", False)
         )
 
@@ -291,6 +307,73 @@ class AutoSellService:
                 order_result="ERROR", error=str(e),
             )
 
+    def execute_stop_loss(self, position: dict, current_price: float) -> dict:
+        """손절매도 실행. 보유수량 전량 시장가 매도."""
+        symbol = position["symbol"]
+        name = position["name"]
+        total_qty = position["quantity"]
+        avg_price = position["avg_buy_price"]
+        profit_rate = self.calculate_profit_rate(avg_price, current_price)
+
+        if total_qty < 1:
+            return self._make_log_entry(
+                symbol=symbol, name=name, avg_price=avg_price,
+                current_price=current_price, profit_rate=profit_rate,
+                qty_before=total_qty, sell_qty=0, sell_type="stop_loss",
+                order_result="SKIP", error="보유수량 0",
+            )
+
+        sym_state = self.state.setdefault(symbol, self._new_state(name, avg_price))
+        sym_state["pending_order"] = True
+        self.save_state()
+
+        try:
+            order = self._broker.sell(
+                symbol=symbol, name=name,
+                quantity=total_qty, price=0, order_type="market",
+            )
+            if order.success:
+                sym_state.update({
+                    "stop_loss_executed": True,
+                    "all_sold": True,
+                    "all_sold_at": datetime.now().isoformat(),
+                    "last_order_id": order.order_id,
+                    "last_sell_type": "stop_loss",
+                    "last_error": None,
+                })
+                logger.info(
+                    "auto_sell: 손절매도 성공 %s %d주 (%.2f%%) order_id=%s",
+                    symbol, total_qty, profit_rate, order.order_id,
+                )
+            else:
+                sym_state["last_error"] = order.message
+                logger.warning("auto_sell: 손절매도 실패 %s: %s", symbol, order.message)
+
+            sym_state["pending_order"] = False
+            self.save_state()
+
+            entry = self._make_log_entry(
+                symbol=symbol, name=name, avg_price=avg_price,
+                current_price=current_price, profit_rate=profit_rate,
+                qty_before=total_qty, sell_qty=total_qty, sell_type="stop_loss",
+                order_result="SUCCESS" if order.success else "FAIL",
+                order_id=order.order_id, error="" if order.success else order.message,
+            )
+            self._append_log(entry)
+            return entry
+
+        except Exception as e:
+            sym_state["pending_order"] = False
+            sym_state["last_error"] = str(e)
+            self.save_state()
+            logger.error("auto_sell: 손절매도 예외 %s: %s", symbol, e)
+            return self._make_log_entry(
+                symbol=symbol, name=name, avg_price=avg_price,
+                current_price=current_price, profit_rate=profit_rate,
+                qty_before=total_qty, sell_qty=total_qty, sell_type="stop_loss",
+                order_result="ERROR", error=str(e),
+            )
+
     # ── 메인 루프 ────────────────────────────────────────────────────────
 
     def run_once(self) -> list[dict]:
@@ -350,8 +433,11 @@ class AutoSellService:
 
             pos_with_rate = {**pos, "current_price": current_price, "profit_rate": profit_rate}
 
-            # 우선순위: +final% 전량매도 먼저
-            if self.should_sell_all(pos_with_rate, sym_state):
+            # 우선순위: 손절 > +final% 전량매도 > +first% 절반매도
+            if self.should_stop_loss(pos_with_rate, sym_state):
+                result = self.execute_stop_loss(pos_with_rate, current_price)
+                results.append(result)
+            elif self.should_sell_all(pos_with_rate, sym_state):
                 result = self.execute_full_sell(pos_with_rate, current_price)
                 results.append(result)
             elif self.should_sell_half(pos_with_rate, sym_state):
@@ -388,6 +474,7 @@ class AutoSellService:
             "avg_buy_price": avg_buy_price,
             "half_sold": False,
             "all_sold": False,
+            "stop_loss_executed": False,
             "half_sold_at": None,
             "all_sold_at": None,
             "last_checked_at": None,

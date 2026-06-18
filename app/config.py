@@ -131,6 +131,7 @@ _DEFAULT_CONFIG = {
         "first_take_profit_sell_ratio": float(os.getenv("AUTO_SELL_FIRST_TP_RATIO", 0.5)),
         "final_take_profit_rate": float(os.getenv("AUTO_SELL_FINAL_TP_RATE", 5.0)),
         "final_take_profit_sell_ratio": float(os.getenv("AUTO_SELL_FINAL_TP_RATIO", 1.0)),
+        "stop_loss_rate": float(os.getenv("AUTO_SELL_STOP_LOSS_RATE", -2.0)),
         "order_type": "market",
         "prevent_duplicate_orders": True,
         "require_real_mode": True,
@@ -161,6 +162,7 @@ _DEFAULT_CONFIG = {
         "max_same_theme_in_top15": 5,
         "max_same_subtheme_in_top15": 4,
         "max_candidates_for_heavy_filters": 30,
+        "max_drop_from_open_rate": 50.0,
     },
 }
 

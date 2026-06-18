@@ -76,7 +76,7 @@ def _get_or_create_service() -> "AutoSellService | None":
         return None
 
 
-def _colour_rate(rate: float) -> str:
+def _colour_rate(rate: float, stop_loss_rate: float = -2.0) -> str:
     rate_str = f"{rate:+.2f}%"
     if rate >= 5.0:
         return f"🔴 {rate_str}"
@@ -84,7 +84,13 @@ def _colour_rate(rate: float) -> str:
         return f"🟡 {rate_str}"
     if rate > 0:
         return f"🟢 {rate_str}"
+    if rate <= stop_loss_rate:
+        return f"🚨 {rate_str}"
     return f"⚪ {rate_str}"
+
+
+def _sell_type_label(sell_type: str) -> str:
+    return {"half": "절반(+3%)", "full": "전량(+5%)", "stop_loss": "손절(-2%)"}.get(sell_type, sell_type)
 
 
 # ---------------------------------------------------------------------------
@@ -179,18 +185,21 @@ else:
 
     # 종목별 상태 테이블
     state = svc_display.state
+    stop_loss_rate = svc_display._stop_loss_rate
     if not state:
         st.info("감시 중인 보유종목이 없습니다.")
     else:
         rows = []
         for sym, s in state.items():
+            sl_done = s.get("stop_loss_executed", False)
             rows.append({
                 "종목코드": sym,
                 "종목명": s.get("name", ""),
                 "매수가": f"{s.get('avg_buy_price', 0):,.0f}원",
-                "수익률": _colour_rate(s.get("last_profit_rate", 0.0)),
+                "수익률": _colour_rate(s.get("last_profit_rate", 0.0), stop_loss_rate),
                 "절반매도(+3%)": "✅ 완료" if s.get("half_sold") else ("⏳ 대기" if not s.get("all_sold") else "—"),
-                "전량매도(+5%)": "✅ 완료" if s.get("all_sold") else "⏳ 대기",
+                "전량매도(+5%)": "✅ 완료" if (s.get("all_sold") and not sl_done) else ("⏳ 대기" if not s.get("all_sold") else "—"),
+                f"손절({stop_loss_rate:.1f}%)": "🚨 실행" if sl_done else "⏳ 대기",
                 "마지막확인": (s.get("last_checked_at") or "—")[:19].replace("T", " "),
                 "오류": s.get("last_error") or "",
             })
@@ -208,7 +217,7 @@ if last_results:
             "시간": r.get("timestamp", ""),
             "종목코드": r.get("symbol", ""),
             "종목명": r.get("name", ""),
-            "매도유형": "절반" if r.get("sell_type") == "half" else "전량",
+            "매도유형": _sell_type_label(r.get("sell_type", "")),
             "수량": r.get("sell_quantity", 0),
             "수익률": f"{r.get('profit_rate', 0.0):+.2f}%",
             "결과": r.get("order_result", ""),
@@ -247,9 +256,10 @@ with st.expander("자동매도 설정 요약", expanded=False):
         auto_cfg = cfg._raw.get("auto_sell", {})
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown(f"- 절반매도 기준: **{auto_cfg.get('first_take_profit_rate', 3.0)}%**")
+            st.markdown(f"- 절반매도 기준: **+{auto_cfg.get('first_take_profit_rate', 3.0)}%**")
             st.markdown(f"- 절반매도 비율: **{auto_cfg.get('first_take_profit_sell_ratio', 0.5)*100:.0f}%**")
-            st.markdown(f"- 전량매도 기준: **{auto_cfg.get('final_take_profit_rate', 5.0)}%**")
+            st.markdown(f"- 전량매도 기준: **+{auto_cfg.get('final_take_profit_rate', 5.0)}%**")
+            st.markdown(f"- 손절 기준: **{auto_cfg.get('stop_loss_rate', -2.0):.1f}%** (이하 전량매도)")
         with col2:
             st.markdown(f"- 주문 유형: **{auto_cfg.get('order_type', 'market')}**")
             st.markdown(f"- 장 시작: **{auto_cfg.get('market_start', '09:00')}**")
