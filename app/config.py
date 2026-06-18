@@ -253,8 +253,23 @@ def get_kis_account_config(mode: str) -> dict:
 
     app_key = os.getenv(app_key_env, "")
     app_secret = os.getenv(app_secret_env, "")
-    account_no = os.getenv(account_no_env, "")
-    product_code = os.getenv(product_code_env, "01")
+    account_no = os.getenv(account_no_env, "").strip()
+    product_code = os.getenv(product_code_env, "").strip()
+
+    # 계좌번호 정규화: KIS API는 CANO=8자리, ACNT_PRDT_CD=2자리 분리 요구
+    # 사용자가 "12345678-01" 또는 "1234567801" 로 입력한 경우 자동 분리
+    if account_no and "-" in account_no:
+        parts = account_no.split("-", 1)
+        account_no = parts[0].strip()
+        if len(parts) > 1 and not product_code:
+            product_code = parts[1].strip().zfill(2)
+    elif account_no and len(account_no) == 10 and account_no.isdigit():
+        if not product_code:
+            product_code = account_no[8:]
+        account_no = account_no[:8]
+
+    if not product_code:
+        product_code = "01"
 
     missing = []
     if not app_key:

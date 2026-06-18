@@ -197,7 +197,7 @@ class KISClient:
             "CANO": self.account_no,
             "ACNT_PRDT_CD": self.product_code,
             "AFHR_FLPR_YN": "N",
-            "OFL_YN": "",
+            "OFL_YN": "N",
             "INQR_DVSN": "02",
             "UNPR_DVSN": "01",
             "FUND_STTL_ICLD_YN": "N",
@@ -213,9 +213,11 @@ class KISClient:
 
             rt_cd = data.get("rt_cd", "")
             if rt_cd != "0":
-                msg = data.get("msg1", "알 수 없는 오류")
-                logger.error(f"[KIS-{self.mode.upper()}] 잔고 조회 실패: rt_cd={rt_cd} msg={msg}")
-                return {"cash": 0.0, "positions": [], "error": f"API 오류(rt_cd={rt_cd}): {msg}"}
+                msg1 = data.get("msg1", "알 수 없는 오류")
+                msg2 = data.get("msg2", "")
+                logger.error(f"[KIS-{self.mode.upper()}] 잔고 조회 실패: rt_cd={rt_cd} msg1={msg1} msg2={msg2}")
+                detail = f"{msg1}" + (f" / {msg2}" if msg2 else "")
+                return {"cash": 0.0, "positions": [], "error": f"rt_cd={rt_cd}: {detail}"}
 
             output2 = data.get("output2") or [{}]
             cash = float((output2[0] if output2 else {}).get("dnca_tot_amt", 0))
@@ -245,12 +247,14 @@ class KISClient:
         tr_id = TR_BUYABLE_MOCK if self.mode == "mock" else TR_BUYABLE_REAL
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
         headers = self._auth_headers(tr_id)
+        # price=0 지정가 조합은 KIS API 거부 → 시장가로 fallback
+        ord_dvsn = ORD_DVSN_MARKET if price == 0 else ORD_DVSN_LIMIT
         params = {
             "CANO": self.account_no,
             "ACNT_PRDT_CD": self.product_code,
             "PDNO": symbol,
             "ORD_UNPR": str(price),
-            "ORD_DVSN": ORD_DVSN_LIMIT,
+            "ORD_DVSN": ord_dvsn,
             "CMA_EVLU_AMT_ICLD_YN": "Y",
             "OVRS_ICLD_YN": "N",
         }

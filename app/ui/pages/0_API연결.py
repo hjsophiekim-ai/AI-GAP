@@ -59,9 +59,13 @@ def _run_test(mode: str, test_name: str) -> None:
                     st.success(f"예수금: **{cash:,.0f}원** | 보유종목: **{pos_cnt}개**")
                     st.session_state[f"{mode}_balance"] = balance
                 else:
-                    st.warning(f"잔고 조회 오류: {balance.get('error')} (장외시간일 수 있습니다)")
+                    err = balance.get("error", "")
+                    st.error(f"잔고 조회 실패: {err}")
+                    if "40310000" in err or "계좌" in err:
+                        st.info("계좌번호를 확인하세요. KIS API는 CANO=8자리 숫자만 허용합니다. "
+                                "예: 12345678 (하이픈/상품코드 제외)")
             except Exception as exc:
-                st.warning(f"잔고 조회 실패: {exc}")
+                st.error(f"잔고 조회 실패: {exc}")
 
     elif test_name == "positions":
         client = st.session_state.get(key_client)
@@ -102,10 +106,13 @@ def _run_test(mode: str, test_name: str) -> None:
         with st.spinner("주문가능금액 조회 중..."):
             try:
                 buyable = client.get_buyable_cash()
-                st.success(f"주문가능금액: **{buyable:,.0f}원**")
+                if buyable > 0:
+                    st.success(f"주문가능금액: **{buyable:,.0f}원**")
+                else:
+                    st.warning("주문가능금액: 0원 (장외시간에는 조회가 제한될 수 있습니다)")
                 st.session_state[f"{mode}_buyable"] = buyable
             except Exception as exc:
-                st.warning(f"주문가능금액 조회 실패: {exc}")
+                st.warning(f"주문가능금액 조회 실패 (장외시간 제한 가능): {exc}")
 
 
 # ---------------------------------------------------------------------------
