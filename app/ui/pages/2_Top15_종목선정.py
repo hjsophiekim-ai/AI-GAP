@@ -461,3 +461,134 @@ if st.session_state.get("top15"):
 
 elif st.session_state.get("candidates"):
     st.info(f"후보 {len(st.session_state['candidates'])}개가 있습니다. 'Top15 종목선정하기'를 클릭하세요.")
+
+# ---------------------------------------------------------------------------
+# 거래량 급증 Top10 섹션
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("거래량 급증 Top10 선정")
+
+st.info(
+    "**상승률 조건: 5% 이상 15% 이하**  \n"
+    "- 5% 미만: 매수 탄력 부족으로 제외  \n"
+    "- 15% 초과: 추격매수 위험으로 제외  \n"
+    "- 상승률 조건 위반 종목은 Top10 부족 시에도 fallback 복구 금지"
+)
+
+if st.button("거래량급증 Top10 선정하기", key="btn_volume_spike", use_container_width=True):
+    vs_progress = st.progress(0, text="시작 중...")
+    vs_log_area = st.empty()
+    vs_msgs: list[str] = []
+
+    def _vs_log(msg: str) -> None:
+        vs_msgs.append(msg)
+        vs_log_area.markdown("\n".join(f"- {m}" for m in vs_msgs))
+
+    try:
+        # STEP 1: 네이버 거래량급증 수집
+        vs_progress.progress(20, text="STEP 1: 네이버 거래량 급증 종목 수집 중...")
+        _vs_log("STEP 1: 네이버 거래량 급증 데이터 수집")
+        try:
+            from app.data.naver_volume_spike_collector import collect_volume_spike_stocks
+            raw_vs = collect_volume_spike_stocks(max_pages=3, max_stocks=80)
+            _vs_log(f"  수집 완료: {len(raw_vs)}개")
+        except Exception as ex:
+            _vs_log(f"  수집 실패: {ex}")
+            raw_vs = []
+
+        if not raw_vs:
+            st.warning("거래량 급증 종목 수집 실패 또는 0개. 네트워크 연결을 확인하세요.")
+            vs_progress.empty()
+        else:
+            # STEP 2: 상승률 5~15% 필터 + Top10 선정
+            vs_progress.progress(60, text="STEP 2: 상승률 5~15% 필터 및 Top10 선정 중...")
+            _vs_log("STEP 2: 상승률 5~15% 필터 + Top10 선정")
+
+            from app.strategy.volume_spike_selector import VolumeSpikeSelector
+            vs_selector = VolumeSpikeSelector()
+            top10_vs, diag = vs_selector.select(raw_vs)
+
+            _vs_log(f"  전체 수집: {diag['total']}개")
+            _vs_log(f"  5% 미만 제외: {diag['excluded_below_5pct']}개")
+            _vs_log(f"  15% 초과 제외: {diag['excluded_above_15pct']}개")
+            _vs_log(f"  상승률 조건 통과: {diag['passed_rate_filter']}개")
+            _vs_log(f"  fallback 추가: {diag['fallback_added']}개")
+            _vs_log(f"  최종 Top10: {diag['final_top10']}개")
+
+            # STEP 3: CSV 저장
+            vs_progress.progress(85, text="STEP 3: CSV 저장 중...")
+            try:
+                date_str = datetime.now().strftime("%Y%m%d")
+                saved_vs = vs_selector.save_top10_csv(top10_vs, date_str=date_str)
+                vs_selector.save_excluded_csv(date_str=date_str)
+                _vs_log(f"  CSV 저장: {saved_vs}")
+            except Exception as ex:
+                _vs_log(f"  CSV 저장 실패: {ex}")
+
+            st.session_state["volume_spike_top10"] = top10_vs
+            st.session_state["volume_spike_diag"] = diag
+            st.session_state["volume_spike_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            vs_progress.progress(100, text="완료!")
+            st.success(f"거래량급증 Top{len(top10_vs)}개 선정 완료!")
+
+    except Exception as ex:
+        st.error(f"거래량급증 선정 오류: {ex}")
+        vs_progress.empty()
+
+# 거래량급증 결과 표시
+if st.session_state.get("volume_spike_top10"):
+    top10_vs = st.session_state["volume_spike_top10"]
+    diag = st.session_state.get("volume_spike_diag", {})
+    at = st.session_state.get("volume_spike_at", "")
+    if at:
+        st.caption(f"선정 시각: {at}")
+
+    # 진단 정보
+    d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+    d_col1.metric("5% 미만 제외", f"{diag.get('excluded_below_5pct', 0)}개")
+    d_col2.metric("15% 초과 제외", f"{diag.get('excluded_above_15pct', 0)}개")
+    d_col3.metric("상승률 조건 통과", f"{diag.get('passed_rate_filter', 0)}개")
+    d_col4.metric("최종 Top10", f"{diag.get('final_top10', 0)}개")
+
+    # 결과 테이블
+    vs_rows = []
+    for s in top10_vs:
+        cr = s.get("change_rate", 0.0)
+        cr_score = s.get("change_rate_score", 0.0)
+        tv = s.get("trade_value", 0.0)
+        cr_band = (
+            "8~12% (최선호)" if 8.0 <= cr <= 12.0
+            else ("5~8% (안정)" if 5.0 <= cr < 8.0
+                  else "12~15% (주의)")
+        )
+        fallback_mark = "✓ fallback" if tv < 3_000_000_000 else ""
+        vs_rows.append({
+            "순위": s.get("rank", ""),
+            "종목코드": s.get("symbol", ""),
+            "종목명": s.get("name", ""),
+            "현재가": f"{int(s.get('current_price', 0)):,}",
+            "상승률(%)": round(cr, 2),
+            "구간": cr_band,
+            "상승률점수": cr_score,
+            "거래대금": _fmt_trade_value(tv),
+            "최종점수": round(s.get("final_score", 0.0), 2),
+            "fallback": fallback_mark,
+        })
+
+    st.dataframe(
+        pd.DataFrame(vs_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # CSV 다운로드
+    vs_csv_buf = io.StringIO()
+    pd.DataFrame(vs_rows).to_csv(vs_csv_buf, index=False, encoding="utf-8-sig")
+    st.download_button(
+        label="거래량급증 Top10 CSV 다운로드",
+        data=vs_csv_buf.getvalue().encode("utf-8-sig"),
+        file_name=f"{datetime.now().strftime('%Y%m%d')}_volume_spike_top10.csv",
+        mime="text/csv",
+        key="dl_vs_top10",
+    )

@@ -1,4 +1,4 @@
-mode: "mock"  # dry_run | mock | real
+mode: "mock"  # dry_run | mock | real  (기본값: mock — 실전은 UI에서 실전모드 활성화 필요)
 
 trading:
   total_budget: 10000000
@@ -44,21 +44,23 @@ naver:
   sise_url: "https://finance.naver.com/sise/"
 
 kis:
+  real:
+    enabled: false                               # 기본 비활성화 — UI 실전모드 버튼으로 override
+    app_key_env: "KIS_REAL_APP_KEY"
+    app_secret_env: "KIS_REAL_APP_SECRET"
+    account_no_env: "KIS_ACCOUNT_NO"             # .env의 실제 키 이름
+    account_product_code_env: "KIS_ACCOUNT_PRODUCT_CODE"
+    product_code_env: "KIS_ACCOUNT_PRODUCT_CODE" # 하위 호환용
+    base_url: "https://openapi.koreainvestment.com:9443"
+
   mock:
+    enabled: true
     app_key_env: "KIS_MOCK_APP_KEY"
     app_secret_env: "KIS_MOCK_APP_SECRET"
     account_no_env: "KIS_MOCK_ACCOUNT_NO"
+    account_product_code_env: "KIS_MOCK_ACCOUNT_PRODUCT_CODE"
     product_code_env: "KIS_MOCK_ACCOUNT_PRODUCT_CODE"
     base_url: "https://openapivts.koreainvestment.com:29443"
-    enabled: true
-
-  real:
-    app_key_env: "KIS_REAL_APP_KEY"
-    app_secret_env: "KIS_REAL_APP_SECRET"
-    account_no_env: "KIS_ACCOUNT_NO"
-    product_code_env: "KIS_ACCOUNT_PRODUCT_CODE"
-    base_url: "https://openapi.koreainvestment.com:9443"
-    enabled: true
 
 dart:
   enabled: true
@@ -80,12 +82,43 @@ ml:
   rule_weight: 0.4
 
 safety:
-  enable_real_trading: true
-  require_real_confirm: true
-  real_confirm_text: "I_UNDERSTAND_REAL_TRADING_RISK"
-  max_real_order_amount: 1000000
-  max_real_daily_budget: 1000000
+  # ── 실전투자 활성화 플래그 (기본값: 모두 false = 안전) ─────────────────────
+  enable_real_trading: false    # 전체 실전투자 마스터 스위치
+  enable_real_buy: false        # 실전 매수 허용
+  enable_real_sell: false       # 실전 매도 허용
+
+  # ── 확인 문구 ──────────────────────────────────────────────────────────────
+  require_real_order_confirm_text: true
+  real_order_confirm_text: "REAL_ORDER_CONFIRMED"
+
+  # ── 주문 한도 ──────────────────────────────────────────────────────────────
+  max_order_amount: 1000000       # 건당 최대 주문금액 (원)
+  max_daily_order_amount: 3000000 # 일일 최대 주문금액 (원)
   max_daily_loss_rate: -5.0
+
+  # ── 하위 호환 (기존 키 유지) ───────────────────────────────────────────────
+  require_real_confirm: true
+  real_confirm_text: "REAL_ORDER_CONFIRMED"
+  max_real_order_amount: 1000000
+  max_real_daily_budget: 3000000
+
+volume_spike:
+  enabled: true
+  source_url: "https://finance.naver.com/sise/sise_quant_high.naver"
+  target_top_n: 10
+  min_price: 20000                # 현재가 20,000원 이하 제외
+  min_change_rate: 5.0            # 상승률 5% 미만 제외 (하드, fallback 복구 금지)
+  max_change_rate: 15.0           # 상승률 15% 초과 제외 (하드, fallback 복구 금지)
+  min_trading_value: 3000000000   # 거래대금 30억 이상 1차 통과
+  fallback_min_trading_value: 1000000000  # fallback 10억 이상 (5~15% 조건 유지)
+  exclude_etf: true
+  exclude_etn: true
+  exclude_preferred: true
+  exclude_spac: true
+  exclude_reit: true
+  exclude_suspended: true
+  quality_stock_preference: true
+  max_candidates_to_score: 80
 
 logging:
   save_csv: true
@@ -96,31 +129,27 @@ logging:
 candidate_quality_filters:
   enabled: true
   speed_mode: true
-  relaxed_mode: true                    # true: 갭/거래대금 감점 처리, false: 기존 하드 제외
-  target_min_candidates: 10            # fallback 발동 기준
+  relaxed_mode: true
+  target_min_candidates: 10
   target_top_n: 15
 
-  # 가격 / 거래대금
   min_price: 1000
-  absolute_min_trading_value: 300000000   # 3억 미만 → 하드 제외
-  min_trading_value_general: 700000000    # 7억 미만 → 강한 감점
-  min_trading_value_0920: 1000000000      # 10억 미만 → 중간 감점
+  absolute_min_trading_value: 300000000
+  min_trading_value_general: 700000000
+  min_trading_value_0920: 1000000000
 
-  # 갭 구간
-  healthy_gap_min: 1.0                 # 1% 미만은 bonus 없음
-  healthy_gap_max: 9.0                 # 1~9% 건강한 갭 → bonus
-  caution_gap_max: 15.0                # 9~15% → 중간 감점
-  hard_exclude_gap_rate: 20.0          # 20% 초과 → 하드 제외
-  caution_gap_rate: 7.0                # (non-relaxed 호환)
-  max_open_gap_rate: 12.0              # (non-relaxed 호환)
+  healthy_gap_min: 1.0
+  healthy_gap_max: 9.0
+  caution_gap_max: 15.0
+  hard_exclude_gap_rate: 20.0
+  caution_gap_rate: 7.0
+  max_open_gap_rate: 12.0
 
-  # 과열/급락 (일봉 필요)
   max_3d_return: 25.0
   max_5d_return: 35.0
   max_intraday_drop_from_high: 4.0
   max_ma20_extension_rate: 15.0
 
-  # 테마 cap
   max_same_theme_in_top15: 5
   max_same_subtheme_in_top15: 4
   max_candidates_for_heavy_filters: 30
