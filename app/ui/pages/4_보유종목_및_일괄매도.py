@@ -11,9 +11,11 @@ import pandas as pd
 from datetime import datetime
 
 try:
-    from app.trading.broker_factory import create_broker
     from app.trading.order_manager import OrderManager
     from app.trading.kis_client import create_kis_client
+    from app.trading.kis_mock_broker import KisMockBroker
+    from app.trading.kis_real_broker import KisRealBroker
+    from app.trading.dry_run_broker import DryRunBroker
     from app.config import get_config
     from app.models import Position
     from app.utils.stock_utils import format_amount, format_price, format_rate
@@ -141,8 +143,9 @@ if fetch_clicked:
         try:
             cfg = get_config()
             if selected_mode == "dry_run":
-                # dry_run: 브로커 통해 메모리 내 가상 포지션 조회
-                broker = create_broker(cfg=cfg, mode="dry_run")
+                # dry_run: 메모리 내 가상 포지션 조회
+                budget = cfg.trading.get("total_budget", 10_000_000)
+                broker = DryRunBroker(initial_balance=float(budget))
                 st.session_state["sell_broker"] = broker
                 positions = broker.get_positions()
                 broker_type = "DryRunBroker"
@@ -298,20 +301,46 @@ has_positions = bool(positions)
 
 
 def _get_or_create_broker():
-    # real 모드: runtime_real_mode가 변경될 수 있으므로 항상 새로 생성
-    if selected_mode == "real":
-        cfg = get_config()
-        return create_broker(
-            cfg=cfg, mode="real",
+    """매도용 브로커 생성. mock / real / dry_run 완전 분리."""
+    if selected_mode == "mock":
+        # KisMockBroker: 안전게이트 없음, 세션 캐시 재사용
+        cached = st.session_state.get("sell_broker")
+        if cached is not None and isinstance(cached, KisMockBroker):
+            return cached
+        kis = st.session_state.get("_sell_kis_client") or create_kis_client("mock")
+        if kis is None:
+            raise RuntimeError(
+                "KIS mock 클라이언트 초기화 실패. "
+                ".env에 KIS_MOCK_APP_KEY, KIS_MOCK_APP_SECRET, KIS_MOCK_ACCOUNT_NO 를 설정하세요."
+            )
+        broker = KisMockBroker(kis)
+        st.session_state["sell_broker"] = broker
+        return broker
+
+    elif selected_mode == "real":
+        # KisRealBroker: 안전게이트 적용, runtime_real_mode 반영위해 항상 새로 생성
+        kis = st.session_state.get("_sell_kis_client") or create_kis_client("real")
+        if kis is None:
+            raise RuntimeError(
+                "KIS real 클라이언트 초기화 실패. "
+                ".env에 KIS_REAL_APP_KEY, KIS_REAL_APP_SECRET, KIS_ACCOUNT_NO 를 설정하세요."
+            )
+        return KisRealBroker(
+            kis,
+            cfg=get_config(),
             confirm_text=confirm_text,
             runtime_real_mode=_runtime_real_mode,
         )
-    broker = st.session_state.get("sell_broker")
-    if broker is None:
-        cfg = get_config()
-        broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text, runtime_real_mode=_runtime_real_mode)
+
+    else:  # dry_run
+        cached = st.session_state.get("sell_broker")
+        if cached is not None and isinstance(cached, DryRunBroker):
+            return cached
+        cfg_tmp = get_config()
+        budget = cfg_tmp.trading.get("total_budget", 10_000_000)
+        broker = DryRunBroker(initial_balance=float(budget))
         st.session_state["sell_broker"] = broker
-    return broker
+        return broker
 
 
 def _save_and_show_results(results, order_mgr):
