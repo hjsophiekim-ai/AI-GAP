@@ -1,8 +1,8 @@
 """
 5_자동매도.py — 자동매도 감시 및 실행 UI
 
-실전모드 활성화 상태에서만 자동매도 ON 가능.
-streamlit-autorefresh로 check_interval_seconds마다 run_once() 자동 실행.
+Mock 계좌: 모의투자 API로 자동매도 테스트.
+Real 계좌: 실전모드 활성화 시 실계좌 자동매도.
 """
 import sys
 from pathlib import Path
@@ -17,14 +17,14 @@ import streamlit as st
 try:
     from app.services.auto_sell_service import AutoSellService
     from app.config import get_config
-    from app.trading.kis_client import create_kis_client
+    from app.trading.kis_mock_broker import KisMockBroker
     from app.trading.kis_real_broker import KisRealBroker
 except Exception as e:
     st.error(f"모듈 로드 오류: {e}")
     st.stop()
 
 # ---------------------------------------------------------------------------
-# autorefresh (optional — graceful fallback if not installed)
+# autorefresh (optional)
 # ---------------------------------------------------------------------------
 _AUTOREFRESH_AVAILABLE = False
 try:
@@ -44,32 +44,41 @@ def _get_cfg():
         return None
 
 
-def _get_or_create_service() -> "AutoSellService | None":
-    """AutoSellService 인스턴스를 session_state에서 가져오거나 새로 생성."""
-    if "auto_sell_service" in st.session_state:
-        svc = st.session_state["auto_sell_service"]
+def _available_accounts() -> list[str]:
+    """발급된 토큰이 있는 계좌 목록 반환."""
+    accounts = []
+    if st.session_state.get("mock_token_ok") and st.session_state.get("mock_client"):
+        accounts.append("mock")
+    if st.session_state.get("real_token_ok") and st.session_state.get("real_client"):
+        accounts.append("real")
+    return accounts
+
+
+def _get_or_create_service(account_type: str) -> "AutoSellService | None":
+    """account_type('mock'|'real')에 맞는 AutoSellService 반환."""
+    svc_key = f"auto_sell_service_{account_type}"
+    if svc_key in st.session_state:
+        svc = st.session_state[svc_key]
         if isinstance(svc, AutoSellService):
             return svc
 
-    # 실전 클라이언트가 session_state에 있어야 생성 가능
-    real_client = st.session_state.get("real_client")
-    if real_client is None:
-        return None
-
-    real_mode_active = st.session_state.get("real_mode_enabled", False)
-    if not real_mode_active:
+    client = st.session_state.get(f"{account_type}_client")
+    if client is None:
         return None
 
     try:
         cfg = get_config()
-        confirm = cfg.real_confirm_text()
-        broker = KisRealBroker(
-            real_client, cfg=cfg,
-            confirm_text=confirm,
-            runtime_real_mode=True,
-        )
-        svc = AutoSellService(kis_client=real_client, broker=broker, cfg=cfg)
-        st.session_state["auto_sell_service"] = svc
+        if account_type == "mock":
+            broker = KisMockBroker(client)
+        else:
+            confirm = cfg.real_confirm_text()
+            broker = KisRealBroker(
+                client, cfg=cfg,
+                confirm_text=confirm,
+                runtime_real_mode=True,
+            )
+        svc = AutoSellService(kis_client=client, broker=broker, cfg=cfg)
+        st.session_state[svc_key] = svc
         return svc
     except Exception as e:
         st.error(f"AutoSellService 초기화 실패: {e}")
@@ -99,38 +108,69 @@ def _sell_type_label(sell_type: str) -> str:
 
 st.title("자동매도 감시")
 
+cfg = _get_cfg()
 real_mode_active: bool = st.session_state.get("real_mode_enabled", False)
 auto_sell_on: bool = st.session_state.get("auto_sell_enabled", False)
-cfg = _get_cfg()
+available = _available_accounts()
+
+# ── 계좌 선택 ──────────────────────────────────────────────────────────────
+st.subheader("계좌 선택")
+
+if not available:
+    st.warning("발급된 토큰이 없습니다. API연결 페이지에서 Mock 또는 Real 계좌 토큰을 먼저 발급하세요.")
+    st.stop()
+
+account_labels = {"mock": "Mock (모의투자)", "real": "Real (실전투자)"}
+radio_options = [account_labels[a] for a in available]
+prev_account = st.session_state.get("auto_sell_account", available[0])
+if prev_account not in available:
+    prev_account = available[0]
+
+selected_label = st.radio(
+    "사용할 계좌",
+    radio_options,
+    index=available.index(prev_account),
+    horizontal=True,
+)
+selected_account = available[radio_options.index(selected_label)]
+
+if selected_account != st.session_state.get("auto_sell_account"):
+    st.session_state["auto_sell_account"] = selected_account
+    st.session_state.pop(f"auto_sell_service_{selected_account}", None)
+    st.session_state["auto_sell_enabled"] = False
+    st.rerun()
 
 # ── 상단 안전 배너 ─────────────────────────────────────────────────────────
-if auto_sell_on and real_mode_active:
-    st.error(
-        "자동매도 ON: 조건 충족 시 실제 계좌에서 매도 주문이 자동 실행됩니다.",
-        icon="🔴",
-    )
+if selected_account == "real":
+    if not real_mode_active:
+        st.warning("Real 계좌 자동매도를 사용하려면 API연결 페이지에서 실전모드를 먼저 활성화하세요.")
+    if auto_sell_on and real_mode_active:
+        st.error("자동매도 ON (실계좌): 조건 충족 시 실제 계좌에서 매도 주문이 자동 실행됩니다.", icon="🔴")
+    else:
+        st.info("자동매도 OFF: 조건을 충족해도 자동 매도되지 않습니다.", icon="ℹ️")
 else:
-    st.info("자동매도 OFF: 조건을 충족해도 자동 매도되지 않습니다.", icon="ℹ️")
-
-if not real_mode_active:
-    st.warning("실전모드가 비활성화되어 있습니다. API연결 페이지에서 실전모드를 먼저 활성화하세요.")
+    if auto_sell_on:
+        st.warning("자동매도 ON (모의계좌): 모의투자 API로 매도 주문이 자동 실행됩니다.", icon="⚠️")
+    else:
+        st.info("자동매도 OFF (모의계좌): 조건을 충족해도 자동 매도되지 않습니다.", icon="ℹ️")
 
 # ── 자동매도 토글 ──────────────────────────────────────────────────────────
 st.subheader("자동매도 설정")
 
 col_toggle, col_interval = st.columns([2, 2])
 with col_toggle:
+    toggle_disabled = (selected_account == "real" and not real_mode_active)
     new_auto_sell = st.toggle(
         "자동매도 활성화",
         value=auto_sell_on,
-        disabled=not real_mode_active,
-        help="실전모드가 활성화된 상태에서만 사용 가능합니다.",
+        disabled=toggle_disabled,
+        help="Real 계좌는 실전모드 활성화 후 사용 가능합니다." if toggle_disabled else "",
         key="auto_sell_toggle",
     )
     if new_auto_sell != auto_sell_on:
         st.session_state["auto_sell_enabled"] = new_auto_sell
         if not new_auto_sell:
-            st.session_state.pop("auto_sell_service", None)
+            st.session_state.pop(f"auto_sell_service_{selected_account}", None)
         st.rerun()
 
 interval_seconds = 10
@@ -140,23 +180,20 @@ if cfg:
 with col_interval:
     st.metric("점검 주기", f"{interval_seconds}초")
 
-# ── 자동갱신 (streamlit-autorefresh) ──────────────────────────────────────
-if auto_sell_on and real_mode_active:
-    if _AUTOREFRESH_AVAILABLE:
-        refresh_count = st_autorefresh(
-            interval=interval_seconds * 1000,
-            key="auto_sell_autorefresh",
-        )
-    else:
-        refresh_count = 0
-        st.caption(f"※ streamlit-autorefresh 미설치 — 수동 새로고침 필요 (pip install streamlit-autorefresh)")
+# ── 자동갱신 및 서비스 실행 ────────────────────────────────────────────────
+can_run = auto_sell_on and (selected_account == "mock" or real_mode_active)
 
-    # 서비스 생성 및 run_once 실행
-    svc = _get_or_create_service()
+if can_run:
+    if _AUTOREFRESH_AVAILABLE:
+        st_autorefresh(interval=interval_seconds * 1000, key="auto_sell_autorefresh")
+    else:
+        st.caption("※ streamlit-autorefresh 미설치 — 수동 새로고침 필요")
+
+    svc = _get_or_create_service(selected_account)
     if svc is None:
         st.error(
-            "AutoSellService를 초기화할 수 없습니다. "
-            "API연결 페이지에서 실전 계좌 토큰을 먼저 발급하세요."
+            f"AutoSellService를 초기화할 수 없습니다. "
+            f"API연결 페이지에서 {selected_label} 토큰을 먼저 발급하세요."
         )
     else:
         with st.spinner("가격 점검 중..."):
@@ -172,18 +209,16 @@ if auto_sell_on and real_mode_active:
 st.divider()
 st.subheader("보유종목 감시 현황")
 
-svc_display = st.session_state.get("auto_sell_service")
+svc_display = st.session_state.get(f"auto_sell_service_{selected_account}")
 
 if svc_display is None:
     st.info("자동매도를 활성화하면 보유종목 감시 현황이 표시됩니다.")
 else:
-    # 마지막 점검 시간
     last_run = svc_display._last_run_time
     st.caption(
         f"마지막 가격 확인: {last_run.strftime('%H:%M:%S') if last_run else '미실행'}"
     )
 
-    # 종목별 상태 테이블
     state = svc_display.state
     stop_loss_rate = svc_display._stop_loss_rate
     if not state:
@@ -203,8 +238,7 @@ else:
                 "마지막확인": (s.get("last_checked_at") or "—")[:19].replace("T", " "),
                 "오류": s.get("last_error") or "",
             })
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 # ── 마지막 자동매도 결과 ────────────────────────────────────────────────────
 last_results = st.session_state.get("auto_sell_last_results", [])
@@ -235,7 +269,6 @@ if svc_display:
     if log_rows:
         df_log = pd.DataFrame(log_rows)
         st.dataframe(df_log, use_container_width=True, hide_index=True)
-
         csv_bytes = df_log.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
             label="CSV 다운로드",

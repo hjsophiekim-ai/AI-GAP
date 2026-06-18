@@ -3,21 +3,28 @@ KisRealBroker - KIS 실전투자 계좌 브로커.
 
 SAFETY: 6가지 안전 조건.
   1. mode == "real"
-  2. config.yaml kis.real.enabled == true
-  3. config.yaml safety.enable_real_trading == true
-  4. 사용자가 real_confirm_text를 정확히 입력
-  5. 주문금액 <= max_real_order_amount  (매수만 적용)
-  6. 일일 총 주문금액 <= max_real_daily_budget  (매수만 적용)
+  2. config.yaml kis.real.enabled == true  OR  runtime_real_mode == True
+  3. config.yaml safety.enable_real_trading == true  OR  runtime_real_mode == True
+  4. 확인 문구 "REAL_ORDER_CONFIRMED" 일치  (항상 필요)
+  5. 매수 전: enable_real_buy == true  OR  runtime_real_mode == True  + 주문금액 한도
+  6. 매도 전: enable_real_sell == true  OR  runtime_real_mode == True
 
 gate 1~4: __init__에서 검사 → 브로커 자체를 못 만들게 차단
-gate 5~6: buy()에서 검사 → OrderResult(success=False) 반환
-sell()  : gate 5~6 체크 없음 (항상 매도 가능해야 함)
-get_positions(): API 오류 시 RuntimeError 발생 (UI가 st.error로 표시)
+gate 5:   buy()에서 검사 → OrderResult(success=False) 반환
+gate 6:   sell()에서 검사 → OrderResult(success=False) 반환
+
+runtime_real_mode=True (UI 실전모드 버튼) 이면 gate 2~3 우회.
+매수/매도 모두 runtime_real_mode가 True일 때만 실제 주문 가능.
 """
 
 from app.trading.broker_base import BrokerBase
 from app.models import OrderResult, Position
 from app.logger import logger
+
+_REAL_MODE_BLOCKED_MSG = (
+    "실전모드가 활성화되어 있지 않습니다. "
+    "실제 주문을 실행하려면 실전모드 버튼을 누르고 확인 문구를 입력하세요."
+)
 
 
 class KisRealBroker(BrokerBase):
@@ -25,46 +32,63 @@ class KisRealBroker(BrokerBase):
 
     mode = "real"
 
-    def __init__(self, kis_client, cfg=None, confirm_text: str = "") -> None:
+    def __init__(
+        self,
+        kis_client,
+        cfg=None,
+        confirm_text: str = "",
+        runtime_real_mode: bool = False,
+    ) -> None:
         from app.config import get_config
         self._cfg = cfg or get_config()
+        self._runtime_real_mode = runtime_real_mode
 
-        # gate 2: kis.real.enabled
+        # gate 2: kis.real.enabled OR runtime_real_mode
         kis_cfg = self._cfg._raw.get("kis", {})
         real_section = kis_cfg.get("real", {})
-        if not real_section.get("enabled", False):
+        real_enabled = real_section.get("enabled", False)
+        if not runtime_real_mode and not real_enabled:
             raise RuntimeError(
-                "KIS real 계좌가 비활성화되어 있습니다. "
-                "config.yaml의 kis.real.enabled를 true로 설정하세요."
+                "실전 계좌가 비활성화되어 있습니다. "
+                "현재 kis.real.enabled=false 또는 실전모드 버튼이 활성화되지 않았습니다. "
+                "실제 주문을 원하면 실전모드를 활성화하세요."
             )
 
-        # gate 3: safety.enable_real_trading
-        if not self._cfg.real_trading_enabled():
+        # gate 3: safety.enable_real_trading OR runtime_real_mode
+        if not runtime_real_mode and not self._cfg.real_trading_enabled():
             raise RuntimeError(
                 "실전투자 모드가 비활성화되어 있습니다. "
-                "config.yaml의 safety.enable_real_trading을 true로 설정하세요."
+                "config.yaml의 safety.enable_real_trading을 true로 설정하거나 "
+                "실전모드를 활성화하세요."
             )
 
-        # gate 4: 확인 문구
+        # gate 4: 확인 문구 (항상 필요)
         expected = self._cfg.real_confirm_text()
         if self._cfg.require_real_confirm() and confirm_text != expected:
             raise RuntimeError(
-                f"실전투자 안전 확인 문구가 틀립니다. '{expected}'를 정확히 입력하세요."
+                f"실전투자 확인 문구가 틀립니다. '{expected}'를 정확히 입력하세요."
             )
 
         self.kis = kis_client
         self._daily_ordered_amount: float = 0.0
 
     # ------------------------------------------------------------------
-    # 주문 금액 안전장치 (gate 5+6, 매수 전용)
+    # 주문 금액 안전장치 (gate 5, 매수 전용)
     # ------------------------------------------------------------------
 
     def _check_order_limits(self, quantity: int, price: float) -> str | None:
         """금액 한도 확인. 위반 시 사유 문자열 반환, 통과 시 None."""
         safety = self._cfg.safety
         order_amt = quantity * price
-        max_order = float(safety.get("max_real_order_amount", 1_000_000))
-        max_daily = float(safety.get("max_real_daily_budget", 1_000_000))
+        # 새 키 우선, 구 키 fallback
+        max_order = float(
+            safety.get("max_order_amount")
+            or safety.get("max_real_order_amount", 1_000_000)
+        )
+        max_daily = float(
+            safety.get("max_daily_order_amount")
+            or safety.get("max_real_daily_budget", 1_000_000)
+        )
         if order_amt > max_order:
             return f"주문금액 초과: {order_amt:,.0f}원 > 한도 {max_order:,.0f}원"
         if self._daily_ordered_amount + order_amt > max_daily:
@@ -130,6 +154,18 @@ class KisRealBroker(BrokerBase):
         price: float,
         order_type: str = "limit",
     ) -> OrderResult:
+        # gate 5a: enable_real_buy OR runtime_real_mode
+        real_buy_ok = self._runtime_real_mode or self._cfg.real_buy_enabled()
+        if not real_buy_ok:
+            logger.warning("REAL 매수 차단 (실전모드 미활성화): %s", symbol)
+            return OrderResult(
+                success=False, mode=self.mode, account_type="real",
+                symbol=symbol, name=name, side="buy",
+                quantity=quantity, price=price, order_type=order_type,
+                order_id="", message=_REAL_MODE_BLOCKED_MSG,
+            )
+
+        # gate 5b: 주문금액 한도
         limit_msg = self._check_order_limits(quantity, price)
         if limit_msg:
             logger.warning("REAL 매수 차단: %s", limit_msg)
@@ -179,6 +215,17 @@ class KisRealBroker(BrokerBase):
         price: float,
         order_type: str = "limit",
     ) -> OrderResult:
+        # gate 6: enable_real_sell OR runtime_real_mode
+        real_sell_ok = self._runtime_real_mode or self._cfg.real_sell_enabled()
+        if not real_sell_ok:
+            logger.warning("REAL 매도 차단 (실전모드 미활성화): %s", symbol)
+            return OrderResult(
+                success=False, mode=self.mode, account_type="real",
+                symbol=symbol, name=name, side="sell",
+                quantity=quantity, price=price, order_type=order_type,
+                order_id="", message=_REAL_MODE_BLOCKED_MSG,
+            )
+
         logger.info(
             "REAL SELL: symbol=%s quantity=%d price=%s", symbol, quantity, price
         )
