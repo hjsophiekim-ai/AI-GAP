@@ -1,10 +1,12 @@
 """
 0_API연결.py - KIS API 연결 테스트 및 계좌 확인 페이지
 """
+import os
 import streamlit as st
 
 try:
     from app.trading.kis_client import create_kis_client
+    from app.config import get_config
 except Exception as e:
     st.error(f"모듈 로드 오류: {e}")
 
@@ -198,3 +200,101 @@ with tab_real:
         st.success("Real 계좌 주문 가능 상태입니다.")
     elif real_ok:
         st.warning("토큰은 발급됐지만 주문가능금액을 확인하세요.")
+
+# ---------------------------------------------------------------------------
+# 실전모드 활성화 섹션
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("실전모드 활성화")
+
+_real_mode_active = st.session_state.get("real_mode_enabled", False)
+
+if _real_mode_active:
+    st.error(
+        "현재 실전모드가 활성화되어 있습니다. 실제 계좌에서 매수와 매도가 모두 실행될 수 있습니다.",
+        icon="🔴",
+    )
+    col_deact, _ = st.columns([1, 3])
+    with col_deact:
+        if st.button("실전모드 해제", type="primary", use_container_width=True):
+            st.session_state.pop("real_mode_enabled", None)
+            st.session_state.pop("enable_real_buy", None)
+            st.session_state.pop("enable_real_sell", None)
+            st.success("실전모드가 해제되었습니다. 이제 모의/안전 모드입니다.")
+            st.rerun()
+else:
+    st.success("현재 모의/안전 모드입니다. 실제 주문은 실행되지 않습니다.", icon="🟢")
+    st.info(
+        "실전모드를 활성화하면 KIS 실전투자 계좌에 실제 주문이 실행됩니다.  \n"
+        "활성화 전 다음 조건이 모두 충족되어야 합니다:  \n"
+        "1. KIS 실전계좌 환경변수(.env)가 설정되어 있어야 합니다.  \n"
+        "2. 아래 확인 문구를 정확히 입력해야 합니다."
+    )
+
+    # 환경변수 존재 여부 사전 확인 (값은 절대 출력하지 않음)
+    try:
+        _cfg_tmp = get_config()
+        kis_real = _cfg_tmp._raw.get("kis", {}).get("real", {})
+        _env_keys = {
+            "APP_KEY":       kis_real.get("app_key_env", "KIS_REAL_APP_KEY"),
+            "APP_SECRET":    kis_real.get("app_secret_env", "KIS_REAL_APP_SECRET"),
+            "ACCOUNT_NO":    kis_real.get("account_no_env", "KIS_ACCOUNT_NO"),
+            "PRODUCT_CODE":  kis_real.get("account_product_code_env", "KIS_ACCOUNT_PRODUCT_CODE"),
+        }
+        _expected_confirm = _cfg_tmp.real_confirm_text()
+    except Exception:
+        _env_keys = {
+            "APP_KEY": "KIS_REAL_APP_KEY",
+            "APP_SECRET": "KIS_REAL_APP_SECRET",
+            "ACCOUNT_NO": "KIS_ACCOUNT_NO",
+            "PRODUCT_CODE": "KIS_ACCOUNT_PRODUCT_CODE",
+        }
+        _expected_confirm = "REAL_ORDER_CONFIRMED"
+
+    with st.expander("환경변수 사전 확인", expanded=True):
+        all_env_ok = True
+        for label, env_name in _env_keys.items():
+            exists = bool(os.getenv(env_name, ""))
+            icon = "✅" if exists else "❌"
+            st.markdown(f"{icon} `{env_name}` — {'설정됨' if exists else '**미설정 (필수)**'}")
+            if not exists:
+                all_env_ok = False
+        if not all_env_ok:
+            st.warning("위 환경변수를 .env 파일에 설정한 후 앱을 재시작하세요.")
+
+    st.markdown("")
+    act_confirm = st.text_input(
+        f"확인 문구 입력 (정확히 `{_expected_confirm}` 를 입력하세요)",
+        type="password",
+        placeholder=_expected_confirm,
+        key="real_mode_confirm_input",
+    )
+
+    col_act, _ = st.columns([1, 3])
+    with col_act:
+        _btn_disabled = not (all_env_ok and act_confirm == _expected_confirm)
+        if st.button(
+            "실전모드 활성화",
+            type="primary",
+            use_container_width=True,
+            disabled=_btn_disabled,
+        ):
+            try:
+                with st.spinner("실전 계좌 연결 확인 중..."):
+                    _test_client = create_kis_client("real")
+                if _test_client is None:
+                    st.error(
+                        "실전 계좌 연결 실패: KIS 클라이언트를 초기화할 수 없습니다.  \n"
+                        ".env 파일의 실전계좌 환경변수를 확인하세요."
+                    )
+                else:
+                    st.session_state["real_mode_enabled"] = True
+                    st.session_state["enable_real_buy"] = True
+                    st.session_state["enable_real_sell"] = True
+                    st.success("실전모드가 활성화되었습니다! 이제 실제 계좌로 주문이 실행됩니다.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"실전모드 활성화 실패: {exc}")
+
+    if act_confirm and act_confirm != _expected_confirm:
+        st.error("확인 문구가 틀립니다. 정확히 입력하세요.")

@@ -67,6 +67,22 @@ with st.sidebar:
     st.markdown(_mode_badge(mode), unsafe_allow_html=True)
     st.divider()
 
+    # Real mode status indicator
+    _real_mode_active_sb = st.session_state.get("real_mode_enabled", False)
+    if _real_mode_active_sb:
+        st.markdown(
+            '<div style="background:#e74c3c;color:#fff;padding:8px 10px;border-radius:4px;'
+            'font-weight:bold;font-size:0.85rem;">🔴 실전모드 ON</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div style="background:#2ecc71;color:#155724;padding:8px 10px;border-radius:4px;'
+            'font-weight:bold;font-size:0.85rem;">🟢 모의/안전모드</div>',
+            unsafe_allow_html=True,
+        )
+    st.divider()
+
     # Date / time — refreshes on each rerun
     now = datetime.now()
     st.markdown(f"**날짜**: {now.strftime('%Y-%m-%d')}")
@@ -82,8 +98,24 @@ with st.sidebar:
 
     st.divider()
 
-    # Safety warning
-    st.warning("⚠️ 실전투자 기본 비활성화\n\n실전 모드 사용 시 config.yaml의 `safety.enable_real_trading` 값을 변경하십시오.")
+    if not _real_mode_active_sb:
+        st.warning("⚠️ 실전투자 기본 비활성화\n\nAPI 연결 페이지에서 실전모드 버튼을 활성화하세요.")
+
+# ---------------------------------------------------------------------------
+# Real mode status banner — top of every page
+# ---------------------------------------------------------------------------
+
+_real_mode_active = st.session_state.get("real_mode_enabled", False)
+if _real_mode_active:
+    st.error(
+        "현재 실전모드입니다. 실제 계좌에서 매수와 매도가 모두 실행될 수 있습니다.",
+        icon="🔴",
+    )
+else:
+    st.success(
+        "현재 모의/안전 모드입니다. 실제 주문은 실행되지 않습니다.",
+        icon="🟢",
+    )
 
 # ---------------------------------------------------------------------------
 # Config-level import error banner

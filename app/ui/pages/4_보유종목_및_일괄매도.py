@@ -48,6 +48,22 @@ elif selected_mode == "mock":
 elif selected_mode == "real":
     st.warning("실전투자 모드: 실제 KIS 계좌의 보유종목이 표시됩니다!")
 
+# 실전모드 활성화 여부 확인
+_runtime_real_mode = False
+if selected_mode == "real":
+    _real_mode_enabled = st.session_state.get("real_mode_enabled", False)
+    if _real_mode_enabled:
+        st.error(
+            "실전모드 활성화 중: 실제 계좌로 매도가 실행됩니다.",
+            icon="🔴",
+        )
+        _runtime_real_mode = True
+    else:
+        st.error(
+            "실전모드가 활성화되어 있지 않습니다.  \n"
+            "'API 연결' 페이지에서 실전모드 버튼을 먼저 활성화하세요."
+        )
+
 confirm_text = ""
 if selected_mode == "real":
     try:
@@ -113,7 +129,7 @@ if fetch_clicked:
     with st.spinner("보유종목을 조회하는 중..."):
         try:
             cfg = get_config()
-            broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text)
+            broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text, runtime_real_mode=_runtime_real_mode)
             st.session_state["sell_broker"] = broker
             broker_type = type(broker).__name__
             positions = broker.get_positions()
@@ -242,7 +258,7 @@ def _get_or_create_broker():
     broker = st.session_state.get("sell_broker")
     if broker is None:
         cfg = get_config()
-        broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text)
+        broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text, runtime_real_mode=_runtime_real_mode)
         st.session_state["sell_broker"] = broker
     return broker
 

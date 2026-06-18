@@ -59,6 +59,22 @@ elif selected_mode == "mock":
 elif selected_mode == "real":
     st.error("실전투자 모드: 실제 KIS 계좌에 주문됩니다. 신중하게 확인하세요!")
 
+# 실전모드 활성화 여부 확인
+_runtime_real_mode = False
+if selected_mode == "real":
+    _real_mode_enabled = st.session_state.get("real_mode_enabled", False)
+    if _real_mode_enabled:
+        st.error(
+            "실전모드 활성화 중: 실제 계좌로 매수가 실행됩니다.",
+            icon="🔴",
+        )
+        _runtime_real_mode = True
+    else:
+        st.error(
+            "실전모드가 활성화되어 있지 않습니다.  \n"
+            "'API 연결' 페이지에서 실전모드 버튼을 먼저 활성화하세요."
+        )
+
 # 실전투자 확인 문구
 confirm_text = ""
 if selected_mode == "real":
@@ -262,7 +278,7 @@ elif buy_type == "종목 선택 매수":
                 try:
                     cfg = get_config()
                     with st.spinner("브로커 초기화 중..."):
-                        broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text)
+                        broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text, runtime_real_mode=_runtime_real_mode)
                     order_manager = OrderManager(broker=broker, cfg=cfg)
 
                     with st.spinner(f"{len(selected_plan)}개 종목 매수 중..."):
@@ -320,7 +336,7 @@ if _execute_buy:
     try:
         cfg = get_config()
         with st.spinner("브로커 초기화 중..."):
-            broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text)
+            broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text, runtime_real_mode=_runtime_real_mode)
         order_manager = OrderManager(broker=broker, cfg=cfg)
 
         with st.spinner("매수 주문 실행 중..."):
