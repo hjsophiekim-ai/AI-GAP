@@ -2,20 +2,68 @@
 3_예산배분_및_매수.py
 
 예산 배분 후 수동 매수 또는 9:20 일괄매수를 실행합니다.
+데이터 소스: 거래량급증 Top10 (session_state["volume_spike_top10"]) 우선
 """
+import types
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from pathlib import Path
 
 try:
     from app.trading.budget_allocator import BudgetAllocator
     from app.trading.broker_factory import create_broker
     from app.trading.order_manager import OrderManager
-    from app.strategy.top15_selector import Top15Selector
     from app.config import get_config
     from app.utils.stock_utils import format_amount, format_price
 except Exception as e:
     st.error(f"모듈 로드 오류: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 거래량급증 dict → BudgetAllocator 호환 객체 변환
+# ---------------------------------------------------------------------------
+
+def _vs_to_candidate(d: dict, rank: int = None):
+    """Volume spike dict → SimpleNamespace (BudgetAllocator 속성 호환)."""
+    return types.SimpleNamespace(
+        rank=rank if rank is not None else int(d.get("rank", 0)),
+        symbol=str(d.get("symbol", "")),
+        name=str(d.get("name", "")),
+        current_price=float(d.get("current_price", 0)),
+        change_rate=float(d.get("change_rate", 0)),
+        trade_value=float(d.get("trade_value", 0)),
+        final_score=float(d.get("final_score", 0)),
+        gap_rate=float(d.get("change_rate", 0)),  # 갭률 대신 상승률 표시
+    )
+
+
+def _load_vs_csv_today() -> list:
+    """오늘 날짜 volume_spike Top10 CSV 로드 → SimpleNamespace 리스트."""
+    date_str = datetime.now().strftime("%Y%m%d")
+    csv_path = (
+        Path(__file__).resolve().parent.parent.parent.parent
+        / "data" / "volume_spike" / f"{date_str}_volume_spike_top10.csv"
+    )
+    if not csv_path.exists():
+        return []
+    try:
+        df = pd.read_csv(csv_path, dtype={"symbol": str})
+        result = []
+        for i, row in df.iterrows():
+            result.append(types.SimpleNamespace(
+                rank=int(row.get("rank", i + 1)),
+                symbol=str(row.get("symbol", "")),
+                name=str(row.get("name", "")),
+                current_price=float(row.get("current_price", 0)),
+                change_rate=float(row.get("change_rate", 0)),
+                trade_value=float(row.get("trade_value", 0)),
+                final_score=float(row.get("final_score", 0)),
+                gap_rate=float(row.get("change_rate", 0)),
+            ))
+        return result
+    except Exception:
+        return []
 
 st.title("예산 배분 및 매수")
 
@@ -94,25 +142,37 @@ if selected_mode == "real":
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Section 2 — Top 15 불러오기
+# Section 2 — 거래량급증 Top10 불러오기
 # ---------------------------------------------------------------------------
-st.subheader("Top 15 불러오기")
+st.subheader("거래량급증 Top10 불러오기")
+st.caption("2단계(거래량급증 Top10 선정)에서 선정한 종목을 불러옵니다.")
 
 col_load1, col_load2 = st.columns([1, 3])
 with col_load1:
-    if st.button("Top 15 불러오기", use_container_width=True):
-        top15 = st.session_state.get("top15") or []
-        if not top15:
-            try:
-                selector = Top15Selector()
-                top15 = selector.load_top15()
-            except Exception as e:
-                st.error(f"Top 15 로드 오류: {e}")
-        if top15:
-            st.session_state["top15"] = top15
-            st.success(f"Top 15 종목 {len(top15)}개 로드 완료")
+    if st.button("Top10 불러오기", use_container_width=True):
+        loaded = []
+        source_label = ""
+
+        # 우선순위 1: 현재 세션의 volume_spike_top10 (거래량급증 dicts)
+        vs_dicts = st.session_state.get("volume_spike_top10") or []
+        if vs_dicts:
+            loaded = [_vs_to_candidate(d) for d in vs_dicts]
+            source_label = f"세션 (거래량급증 {len(loaded)}개)"
+
+        # 우선순위 2: 오늘 저장된 volume_spike CSV
+        if not loaded:
+            loaded = _load_vs_csv_today()
+            if loaded:
+                source_label = f"오늘 CSV (거래량급증 {len(loaded)}개)"
+
+        if loaded:
+            st.session_state["top15"] = loaded
+            st.success(f"종목 {len(loaded)}개 로드 완료 ({source_label})")
         else:
-            st.warning("Top 15 종목이 없습니다. 2단계(Top15 선정)를 먼저 실행하세요.")
+            st.warning(
+                "거래량급증 종목이 없습니다.  \n"
+                "'거래량급증 Top10 선정' 탭에서 먼저 종목을 선정하세요."
+            )
 
 top15 = st.session_state.get("top15", [])
 if top15:
@@ -122,8 +182,8 @@ if top15:
             "종목코드": c.symbol,
             "종목명": c.name,
             "현재가": format_price(c.current_price),
-            "갭률(%)": f"{c.gap_rate:.2f}",
-            "최종점수": f"{c.final_score:.4f}",
+            "상승률(%)": f"{c.change_rate:.2f}",
+            "최종점수": f"{c.final_score:.2f}",
         }
         for c in top15
     ]
