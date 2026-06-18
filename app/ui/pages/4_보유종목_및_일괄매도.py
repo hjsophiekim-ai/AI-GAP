@@ -6,6 +6,12 @@
 - 10:15 일괄매도 (예약)
 - 조건 매도 (수익률 기준: 절반매도 / 전량매도 / 손절)
 """
+import sys
+from pathlib import Path
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime

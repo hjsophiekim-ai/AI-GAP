@@ -4,11 +4,16 @@
 예산 배분 후 수동 매수 또는 9:20 일괄매수를 실행합니다.
 데이터 소스: 거래량급증 Top10 (session_state["volume_spike_top10"]) 우선
 """
+import sys
+from pathlib import Path
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import types
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from pathlib import Path
 
 try:
     from app.trading.budget_allocator import BudgetAllocator
@@ -18,6 +23,7 @@ try:
     from app.utils.stock_utils import format_amount, format_price
 except Exception as e:
     st.error(f"모듈 로드 오류: {e}")
+    st.stop()
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,12 @@
 """
 0_API연결.py - KIS API 연결 테스트 및 계좌 확인 페이지
 """
+import sys
+from pathlib import Path
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import os
 import streamlit as st
 
@@ -9,6 +15,7 @@ try:
     from app.config import get_config
 except Exception as e:
     st.error(f"모듈 로드 오류: {e}")
+    st.stop()
 
 st.title("KIS API 연결")
 st.caption("Mock(모의투자) / Real(실전투자) 계좌 연결 상태를 확인합니다.")

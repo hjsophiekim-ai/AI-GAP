@@ -6,6 +6,12 @@
 현재가 조회: https://finance.naver.com/ (일반 페이지)
 """
 
+import sys
+from pathlib import Path
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import io
 from datetime import datetime
 
@@ -18,6 +24,7 @@ try:
     from app.config import get_config
 except Exception as e:
     st.error(f"모듈 로드 오류: {e}")
+    st.stop()
 
 st.title("거래량급증 Top10 종목 선정")
 st.caption("데이터 소스: 네이버 증권 거래량급증 — https://finance.naver.com/sise/sise_quant_high.naver")
