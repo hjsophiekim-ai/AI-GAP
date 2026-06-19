@@ -38,10 +38,15 @@ class KisRealBroker(BrokerBase):
         cfg=None,
         confirm_text: str = "",
         runtime_real_mode: bool = False,
+        runtime_enable_real_buy: bool = False,
+        runtime_enable_real_sell: bool = False,
+        **kwargs,
     ) -> None:
         from app.config import get_config
         self._cfg = cfg or get_config()
         self._runtime_real_mode = runtime_real_mode
+        self._runtime_enable_real_buy = runtime_enable_real_buy
+        self._runtime_enable_real_sell = runtime_enable_real_sell
 
         # gate 2: kis.real.enabled OR runtime_real_mode
         kis_cfg = self._cfg._raw.get("kis", {})
@@ -154,8 +159,12 @@ class KisRealBroker(BrokerBase):
         price: float,
         order_type: str = "limit",
     ) -> OrderResult:
-        # gate 5a: enable_real_buy OR runtime_real_mode
-        real_buy_ok = self._runtime_real_mode or self._cfg.real_buy_enabled()
+        # gate 5a: enable_real_buy OR runtime flags
+        real_buy_ok = (
+            self._runtime_real_mode
+            or self._runtime_enable_real_buy
+            or self._cfg.real_buy_enabled()
+        )
         if not real_buy_ok:
             logger.warning("REAL 매수 차단 (실전모드 미활성화): %s", symbol)
             return OrderResult(
@@ -215,8 +224,12 @@ class KisRealBroker(BrokerBase):
         price: float,
         order_type: str = "limit",
     ) -> OrderResult:
-        # gate 6: enable_real_sell OR runtime_real_mode
-        real_sell_ok = self._runtime_real_mode or self._cfg.real_sell_enabled()
+        # gate 6: enable_real_sell OR runtime flags
+        real_sell_ok = (
+            self._runtime_real_mode
+            or self._runtime_enable_real_sell
+            or self._cfg.real_sell_enabled()
+        )
         if not real_sell_ok:
             logger.warning("REAL 매도 차단 (실전모드 미활성화): %s", symbol)
             return OrderResult(

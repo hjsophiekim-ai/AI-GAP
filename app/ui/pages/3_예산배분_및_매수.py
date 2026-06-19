@@ -14,6 +14,12 @@ import types
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _KST = _ZoneInfo("Asia/Seoul")
+except ImportError:
+    import datetime as _dtmod
+    _KST = _dtmod.timezone(_dtmod.timedelta(hours=9))
 
 try:
     from app.trading.budget_allocator import BudgetAllocator
@@ -24,6 +30,28 @@ try:
 except Exception as e:
     st.error(f"모듈 로드 오류: {e}")
     st.stop()
+
+
+def _safe_create_broker(cfg, mode, confirm_text="", runtime_real_mode=False,
+                         runtime_enable_real_buy=False, runtime_enable_real_sell=False):
+    """구/신 버전 broker_factory 모두 호환 — TypeError 발생 시 순서대로 폴백."""
+    try:
+        return create_broker(
+            cfg=cfg, mode=mode,
+            confirm_text=confirm_text,
+            runtime_real_mode=runtime_real_mode,
+            runtime_enable_real_buy=runtime_enable_real_buy,
+            runtime_enable_real_sell=runtime_enable_real_sell,
+        )
+    except TypeError:
+        try:
+            return create_broker(cfg=cfg, mode=mode, confirm_text=confirm_text,
+                                 runtime_real_mode=runtime_real_mode)
+        except TypeError:
+            try:
+                return create_broker(cfg=cfg, mode=mode, confirm_text=confirm_text)
+            except TypeError:
+                return create_broker(cfg=cfg, mode=mode)
 
 
 # ---------------------------------------------------------------------------
@@ -40,13 +68,13 @@ def _vs_to_candidate(d: dict, rank: int = None):
         change_rate=float(d.get("change_rate", 0)),
         trade_value=float(d.get("trade_value", 0)),
         final_score=float(d.get("final_score", 0)),
-        gap_rate=float(d.get("change_rate", 0)),  # 갭률 대신 상승률 표시
+        gap_rate=float(d.get("change_rate", 0)),
     )
 
 
 def _load_vs_csv_today() -> list:
     """오늘 날짜 volume_spike Top10 CSV 로드 → SimpleNamespace 리스트."""
-    date_str = datetime.now().strftime("%Y%m%d")
+    date_str = datetime.now(_KST).strftime("%Y%m%d")
     csv_path = (
         Path(__file__).resolve().parent.parent.parent.parent
         / "data" / "volume_spike" / f"{date_str}_volume_spike_top10.csv"
@@ -113,15 +141,15 @@ elif selected_mode == "mock":
 elif selected_mode == "real":
     st.error("실전투자 모드: 실제 KIS 계좌에 주문됩니다. 신중하게 확인하세요!")
 
-# 실전모드 활성화 여부 확인
+# 실전모드 런타임 플래그
 _runtime_real_mode = False
+_runtime_enable_real_buy = st.session_state.get("enable_real_buy", False)
+_runtime_enable_real_sell = st.session_state.get("enable_real_sell", False)
+
 if selected_mode == "real":
     _real_mode_enabled = st.session_state.get("real_mode_enabled", False)
     if _real_mode_enabled:
-        st.error(
-            "실전모드 활성화 중: 실제 계좌로 매수가 실행됩니다.",
-            icon="🔴",
-        )
+        st.error("실전모드 활성화 중: 실제 계좌로 매수가 실행됩니다.", icon="🔴")
         _runtime_real_mode = True
     else:
         st.error(
@@ -145,6 +173,15 @@ if selected_mode == "real":
     if confirm_text and confirm_text != expected_text:
         st.error("확인 문구가 틀립니다. 매수 버튼이 비활성화됩니다.")
 
+# ── 브로커/모드 상태 표시 ──────────────────────────────────────────────────
+with st.expander("브로커 상태 확인", expanded=False):
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("선택 모드", selected_mode.upper())
+    s2.metric("실전모드", "ON" if _runtime_real_mode else "OFF")
+    s3.metric("실전매수", "허용" if _runtime_enable_real_buy else "차단")
+    s4.metric("실전매도", "허용" if _runtime_enable_real_sell else "차단")
+    st.caption("※ API 키/계좌번호 등 민감정보는 표시하지 않습니다.")
+
 st.divider()
 
 # ---------------------------------------------------------------------------
@@ -159,13 +196,11 @@ with col_load1:
         loaded = []
         source_label = ""
 
-        # 우선순위 1: 현재 세션의 volume_spike_top10 (거래량급증 dicts)
         vs_dicts = st.session_state.get("volume_spike_top10") or []
         if vs_dicts:
             loaded = [_vs_to_candidate(d) for d in vs_dicts]
             source_label = f"세션 (거래량급증 {len(loaded)}개)"
 
-        # 우선순위 2: 오늘 저장된 volume_spike CSV
         if not loaded:
             loaded = _load_vs_csv_today()
             if loaded:
@@ -264,16 +299,17 @@ real_confirm_ok = (
     ))
 )
 
-_execute_buy = False  # 수동/9:20 공통 실행 플래그
+_execute_buy = False
 
 # ── 수동 매수 ──────────────────────────────────────────────────────────────
 if buy_type == "수동 매수":
     buy_disabled = not has_plan or not real_confirm_ok
     if st.button(
-        "지금 매수 실행",
+        "현재 리스트 전부 매수",
         disabled=buy_disabled,
         type="primary",
         use_container_width=True,
+        key="btn_manual_buy_all",
     ):
         _execute_buy = True
 
@@ -284,11 +320,17 @@ if buy_type == "수동 매수":
 
 # ── 9:20 일괄매수 예약 ────────────────────────────────────────────────────
 elif buy_type == "9:20 일괄매수 (예약)":
-    now = datetime.now()
+    # Render 서버는 UTC로 동작하므로 반드시 KST(UTC+9) 명시
+    now = datetime.now(_KST)
     h, m = now.hour, now.minute
     is_920 = (h == 9 and 18 <= m <= 22)  # 9:18~9:22 허용 범위
 
-    st.markdown(f"**현재 시각**: {now.strftime('%H:%M:%S')}")
+    col_time, col_refresh = st.columns([4, 1])
+    with col_time:
+        st.markdown(f"**현재 시각 (KST)**: {now.strftime('%H:%M:%S')}")
+    with col_refresh:
+        if st.button("시간 갱신", use_container_width=True, key="btn_refresh_time"):
+            st.rerun()
 
     if is_920:
         st.success("9:20 매수 시간입니다! 아래 버튼을 눌러 매수를 실행하세요.")
@@ -305,7 +347,10 @@ elif buy_type == "9:20 일괄매수 (예약)":
         _execute_buy = True
 
     if not is_920:
-        st.caption(f"현재 {now.strftime('%H:%M')} — 9:18~9:22 사이에만 버튼이 활성화됩니다.")
+        st.caption(
+            f"현재 {now.strftime('%H:%M')} (KST) — 9:18~9:22 사이에만 버튼이 활성화됩니다.  \n"
+            "시간이 되면 위 '시간 갱신' 버튼을 눌러 페이지를 새로고침하세요."
+        )
 
 # ── 종목 선택 매수 ────────────────────────────────────────────────────────
 elif buy_type == "종목 선택 매수":
@@ -344,7 +389,13 @@ elif buy_type == "종목 선택 매수":
                 try:
                     cfg = get_config()
                     with st.spinner("브로커 초기화 중..."):
-                        broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text, runtime_real_mode=_runtime_real_mode)
+                        broker = _safe_create_broker(
+                            cfg=cfg, mode=selected_mode,
+                            confirm_text=confirm_text,
+                            runtime_real_mode=_runtime_real_mode,
+                            runtime_enable_real_buy=_runtime_enable_real_buy,
+                            runtime_enable_real_sell=_runtime_enable_real_sell,
+                        )
                     order_manager = OrderManager(broker=broker, cfg=cfg)
 
                     with st.spinner(f"{len(selected_plan)}개 종목 매수 중..."):
@@ -393,7 +444,7 @@ elif buy_type == "종목 선택 매수":
                 except RuntimeError as e:
                     st.error(f"안전장치 차단: {e}")
                 except Exception as e:
-                    st.error(f"매수 오류: {e}")
+                    st.error(f"브로커 생성 실패: 실전모드 설정 또는 KIS 환경변수를 확인하세요.\n상세: {e}")
         else:
             st.info("위에서 매수할 종목을 선택하세요.")
 
@@ -402,7 +453,13 @@ if _execute_buy:
     try:
         cfg = get_config()
         with st.spinner("브로커 초기화 중..."):
-            broker = create_broker(cfg=cfg, mode=selected_mode, confirm_text=confirm_text, runtime_real_mode=_runtime_real_mode)
+            broker = _safe_create_broker(
+                cfg=cfg, mode=selected_mode,
+                confirm_text=confirm_text,
+                runtime_real_mode=_runtime_real_mode,
+                runtime_enable_real_buy=_runtime_enable_real_buy,
+                runtime_enable_real_sell=_runtime_enable_real_sell,
+            )
         order_manager = OrderManager(broker=broker, cfg=cfg)
 
         with st.spinner("매수 주문 실행 중..."):
@@ -452,7 +509,7 @@ if _execute_buy:
     except RuntimeError as e:
         st.error(f"매수 실행 오류 (안전장치 차단): {e}")
     except Exception as e:
-        st.error(f"예상치 못한 오류: {e}")
+        st.error(f"브로커 생성 실패: 실전모드 설정 또는 KIS 환경변수를 확인하세요.\n상세: {e}")
 
 # 이전 결과 표시
 if st.session_state.get("buy_results") and not _execute_buy:
