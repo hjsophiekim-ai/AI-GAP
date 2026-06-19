@@ -3,11 +3,19 @@ KISClient - 한국투자증권 Open API 공통 클라이언트.
 
 mock(모의투자)과 real(실전투자)을 mode 파라미터로 분리합니다.
 API 키/시크릿/토큰은 로그에 절대 출력하지 않습니다.
+토큰은 메모리 + JSON 파일 이중 캐싱합니다 (5분 버퍼 만료 체크).
 """
 
+import hashlib
+import json
 import requests
 from datetime import datetime, timedelta
+from pathlib import Path
 from app.logger import logger
+
+# ── token cache directory ───────────────────────────────────────────────────
+_ROOT = Path(__file__).resolve().parent.parent.parent  # repo root
+_TOKEN_CACHE_DIR = _ROOT / "data" / "cache"
 
 # ── base URLs ──────────────────────────────────────────────────────────────
 BASE_URL_MOCK = "https://openapivts.koreainvestment.com:29443"
@@ -28,13 +36,18 @@ TR_BUY_MOCK = "VTTC0802U"
 TR_SELL_REAL = "TTTC0801U"
 TR_SELL_MOCK = "VTTC0801U"
 
-TR_ORDER_HISTORY_REAL = "TTTC8001R"   # 공식 문서 확인 필요
-TR_ORDER_HISTORY_MOCK = "VTTC8001R"   # 공식 문서 확인 필요
+TR_ORDER_HISTORY_REAL = "TTTC8001R"
+TR_ORDER_HISTORY_MOCK = "VTTC8001R"
 
-TR_DAILY_PRICE = "FHKST01010400"      # 국내주식 일별 주가
+TR_DAILY_PRICE = "FHKST01010400"
 
 ORD_DVSN_LIMIT = "00"
 ORD_DVSN_MARKET = "01"
+
+
+class KISTokenError(Exception):
+    """KIS oauth2/tokenP 403 오류 — 이 예외가 발생하면 배치 전체를 중단해야 합니다."""
+    pass
 
 
 class KISClient:
@@ -69,7 +82,7 @@ class KISClient:
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json; charset=utf-8"})
 
-    # ── 공개 속성 (브로커 서브클래스에서 헤더 구성에 사용) ─────────────────
+    # ── 공개 속성 ─────────────────────────────────────────────────────────
 
     @property
     def app_key(self) -> str:
@@ -79,11 +92,10 @@ class KISClient:
     def app_secret(self) -> str:
         return self._app_secret
 
-    # ── 공개 팩토리 ───────────────────────────────────────────────────────
+    # ── 팩토리 ────────────────────────────────────────────────────────────
 
     @classmethod
     def from_account_config(cls, account_cfg: dict) -> "KISClient":
-        """get_kis_account_config()의 반환값을 받아 인스턴스를 생성합니다."""
         return cls(
             app_key=account_cfg["app_key"],
             app_secret=account_cfg["app_secret"],
@@ -95,14 +107,76 @@ class KISClient:
     def is_configured(self) -> bool:
         return bool(self._app_key and self._app_secret and self.account_no)
 
-    # ── 토큰 ──────────────────────────────────────────────────────────────
+    # ── 토큰 파일 캐시 ────────────────────────────────────────────────────
+
+    def _token_cache_path(self) -> Path:
+        return _TOKEN_CACHE_DIR / f"kis_token_{self.mode}.json"
+
+    def _app_key_hash(self) -> str:
+        return hashlib.sha256(self._app_key.encode()).hexdigest()[:16]
+
+    def _load_token_cache(self) -> bool:
+        """파일 캐시에서 토큰 로드. 유효(5분 버퍼)하면 True."""
+        try:
+            path = self._token_cache_path()
+            if not path.exists():
+                return False
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            expires_at_str = data.get("expires_at", "")
+            if not expires_at_str:
+                return False
+            expires_at = datetime.fromisoformat(expires_at_str)
+            if datetime.now() >= expires_at - timedelta(minutes=5):
+                logger.debug(f"[KIS-{self.mode.upper()}] 파일 캐시 토큰 만료")
+                return False
+            stored_hash = data.get("app_key_hash", "")
+            if stored_hash != self._app_key_hash():
+                logger.info(f"[KIS-{self.mode.upper()}] 토큰 캐시 무효: app_key 변경")
+                return False
+            self._token = data.get("access_token", "")
+            self._token_expires_at = expires_at
+            logger.info(
+                f"[KIS-{self.mode.upper()}] 파일 캐시에서 토큰 로드 (만료: {expires_at:%H:%M:%S})"
+            )
+            return bool(self._token)
+        except Exception as e:
+            logger.debug(f"[KIS-{self.mode.upper()}] 토큰 캐시 로드 실패: {e}")
+            return False
+
+    def _save_token_cache(self) -> None:
+        """현재 토큰을 파일 캐시에 저장."""
+        try:
+            _TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            data = {
+                "access_token": self._token,
+                "expires_at": self._token_expires_at.isoformat(),
+                "mode": self.mode,
+                "app_key_hash": self._app_key_hash(),
+                "base_url": self.base_url,
+            }
+            with open(self._token_cache_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.debug(f"[KIS-{self.mode.upper()}] 토큰 파일 캐시 저장 완료")
+        except Exception as e:
+            logger.warning(f"[KIS-{self.mode.upper()}] 토큰 캐시 저장 실패: {e}")
+
+    # ── 토큰 발급 ─────────────────────────────────────────────────────────
 
     def get_access_token(self) -> str:
-        """액세스 토큰 발급/갱신 (만료 1분 전 자동 갱신)."""
+        """
+        액세스 토큰 발급/갱신.
+        1) 메모리 캐시 (5분 버퍼) → 2) 파일 캐시 → 3) tokenP API 호출.
+        403 응답 시 KISTokenError 발생 (배치 전체 중단 신호).
+        """
         now = datetime.now()
-        if self._token and now < self._token_expires_at - timedelta(minutes=1):
+        # 1. 메모리 캐시
+        if self._token and now < self._token_expires_at - timedelta(minutes=5):
             return self._token
-
+        # 2. 파일 캐시
+        if self._load_token_cache():
+            return self._token
+        # 3. API 호출
         url = f"{self.base_url}/oauth2/tokenP"
         body = {
             "grant_type": "client_credentials",
@@ -111,13 +185,35 @@ class KISClient:
         }
         try:
             resp = self._session.post(url, json=body, timeout=10)
+            if resp.status_code == 403:
+                rt_cd = msg_cd = msg1 = ""
+                try:
+                    err_data = resp.json()
+                    rt_cd = err_data.get("rt_cd", "")
+                    msg_cd = err_data.get("msg_cd", "")
+                    msg1 = err_data.get("msg1", err_data.get("error_description", ""))
+                except Exception:
+                    pass
+                key_exists = bool(self._app_key and self._app_secret)
+                cache_exists = self._token_cache_path().exists()
+                raise KISTokenError(
+                    f"[KIS-{self.mode.upper()}] tokenP 403 오류 | "
+                    f"mode={self.mode} base_url={self.base_url} "
+                    f"key_exists={key_exists} cache_exists={cache_exists} | "
+                    f"rt_cd={rt_cd!r} msg_cd={msg_cd!r} msg1={msg1!r}"
+                )
             resp.raise_for_status()
             data = resp.json()
             self._token = data.get("access_token", "")
             expires_in = int(data.get("expires_in", 86400))
             self._token_expires_at = now + timedelta(seconds=expires_in)
-            logger.info(f"[KIS-{self.mode.upper()}] 토큰 발급 완료 (만료: {self._token_expires_at:%H:%M:%S})")
+            self._save_token_cache()
+            logger.info(
+                f"[KIS-{self.mode.upper()}] 토큰 발급 완료 (만료: {self._token_expires_at:%H:%M:%S})"
+            )
             return self._token
+        except KISTokenError:
+            raise
         except Exception as e:
             logger.error(f"[KIS-{self.mode.upper()}] 토큰 발급 실패: {e}")
             raise
@@ -152,12 +248,7 @@ class KISClient:
     # ── 현재가 조회 ────────────────────────────────────────────────────────
 
     def get_current_price(self, symbol: str) -> dict | None:
-        """
-        국내주식 현재가 조회.
-        반환: {"current_price": float, "open": float, "high": float, "low": float,
-               "prev_close": float, "change_rate": float, "volume": int, "trade_value": float}
-        실패 시 None 반환.
-        """
+        """국내주식 현재가 조회. 실패 시 None 반환."""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
         headers = self._auth_headers(TR_CURRENT_PRICE)
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol}
@@ -185,11 +276,7 @@ class KISClient:
     # ── 잔고 조회 ──────────────────────────────────────────────────────────
 
     def get_balance(self) -> dict:
-        """
-        계좌 잔고 조회.
-        반환: {"cash": float, "positions": [{"symbol","name","quantity","avg_price","current_price"}]}
-        실패 시 {"cash": 0, "positions": [], "error": str} 반환.
-        """
+        """계좌 잔고 조회. 실패 시 {"cash": 0, "positions": [], "error": str} 반환."""
         tr_id = TR_BALANCE_MOCK if self.mode == "mock" else TR_BALANCE_REAL
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
         headers = self._auth_headers(tr_id)
@@ -215,7 +302,10 @@ class KISClient:
             if rt_cd != "0":
                 msg1 = data.get("msg1", "알 수 없는 오류")
                 msg2 = data.get("msg2", "")
-                logger.error(f"[KIS-{self.mode.upper()}] 잔고 조회 실패: rt_cd={rt_cd} msg1={msg1} msg2={msg2}")
+                logger.error(
+                    f"[KIS-{self.mode.upper()}] 잔고 조회 실패: "
+                    f"rt_cd={rt_cd} msg1={msg1} msg2={msg2}"
+                )
                 detail = f"{msg1}" + (f" / {msg2}" if msg2 else "")
                 return {"cash": 0.0, "positions": [], "error": f"rt_cd={rt_cd}: {detail}"}
 
@@ -234,7 +324,10 @@ class KISClient:
                     "avg_price": float(item.get("pchs_avg_pric", 0) or 0),
                     "current_price": float(item.get("prpr", 0) or 0),
                 })
-            logger.info(f"[KIS-{self.mode.upper()}] 잔고 조회 성공: {len(positions)}종목 현금={cash:,.0f}원")
+            logger.info(
+                f"[KIS-{self.mode.upper()}] 잔고 조회 성공: "
+                f"{len(positions)}종목 현금={cash:,.0f}원"
+            )
             return {"cash": cash, "positions": positions}
         except Exception as e:
             logger.error(f"[KIS-{self.mode.upper()}] 잔고 조회 예외: {e}")
@@ -243,11 +336,9 @@ class KISClient:
     # ── 주문 가능 금액 ────────────────────────────────────────────────────
 
     def get_buyable_cash(self, symbol: str = "005930", price: int = 0) -> float:
-        """주문 가능 현금 조회. 실패 시 0 반환."""
         tr_id = TR_BUYABLE_MOCK if self.mode == "mock" else TR_BUYABLE_REAL
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
         headers = self._auth_headers(tr_id)
-        # price=0 지정가 조합은 KIS API 거부 → 시장가로 fallback
         ord_dvsn = ORD_DVSN_MARKET if price == 0 else ORD_DVSN_LIMIT
         params = {
             "CANO": self.account_no,
@@ -267,15 +358,9 @@ class KISClient:
             logger.warning(f"[KIS-{self.mode.upper()}] 주문가능금액 조회 실패: {e}")
             return 0.0
 
-    # ── 일별 주가 조회 (MA 계산용) ────────────────────────────────────────
+    # ── 일별 주가 조회 ────────────────────────────────────────────────────
 
     def get_daily_prices(self, symbol: str, days: int = 65) -> list[dict]:
-        """
-        국내주식 일별 주가 조회 (최근 N 영업일).
-        반환: [{"date": "20260617", "close": float, "open": float, "high": float, "low": float, "volume": int}, ...]
-        날짜 내림차순 (가장 최근이 [0]).
-        실패 시 [] 반환.
-        """
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-price"
         headers = self._auth_headers(TR_DAILY_PRICE)
         params = {
@@ -315,10 +400,6 @@ class KISClient:
         price: int,
         order_type: str = "limit",
     ) -> dict:
-        """
-        매수 주문 실행.
-        반환: {"success": bool, "order_id": str, "message": str, "raw": dict}
-        """
         tr_id = TR_BUY_MOCK if self.mode == "mock" else TR_BUY_REAL
         ord_dvsn = ORD_DVSN_MARKET if order_type == "market" else ORD_DVSN_LIMIT
         body = {
@@ -340,10 +421,6 @@ class KISClient:
         price: int,
         order_type: str = "limit",
     ) -> dict:
-        """
-        매도 주문 실행.
-        반환: {"success": bool, "order_id": str, "message": str, "raw": dict}
-        """
         tr_id = TR_SELL_MOCK if self.mode == "mock" else TR_SELL_REAL
         ord_dvsn = ORD_DVSN_MARKET if order_type == "market" else ORD_DVSN_LIMIT
         body = {
@@ -380,22 +457,66 @@ class KISClient:
 
         try:
             resp = self._session.post(url, json=body, headers=headers, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
+            http_status = resp.status_code
+
+            # raise_for_status 호출 전에 body 파싱 (500 오류 원인 확인)
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+
             rt_cd = data.get("rt_cd", "")
+            msg_cd = data.get("msg_cd", "")
+            msg1 = data.get("msg1", "")
+
+            if not resp.ok:
+                logger.error(
+                    f"[KIS-{self.mode.upper()}] order-cash HTTP {http_status}: "
+                    f"rt_cd={rt_cd!r} msg_cd={msg_cd!r} msg1={msg1!r}"
+                )
+                return {
+                    "success": False,
+                    "order_id": "",
+                    "message": f"HTTP {http_status}: rt_cd={rt_cd} msg_cd={msg_cd} msg1={msg1}",
+                    "raw": data,
+                    "http_status": http_status,
+                }
+
             output = data.get("output", {})
             order_id = output.get("ODNO", "")
-            msg = data.get("msg1", "")
 
             if rt_cd == "0":
                 logger.info(f"[KIS-{self.mode.upper()}] 주문 성공: order_id={order_id}")
-                return {"success": True, "order_id": order_id, "message": msg, "raw": output}
+                return {
+                    "success": True,
+                    "order_id": order_id,
+                    "message": msg1,
+                    "raw": output,
+                    "http_status": http_status,
+                }
             else:
-                logger.warning(f"[KIS-{self.mode.upper()}] 주문 실패: rt_cd={rt_cd} msg={msg}")
-                return {"success": False, "order_id": "", "message": msg, "raw": data}
+                logger.warning(
+                    f"[KIS-{self.mode.upper()}] 주문 실패: "
+                    f"rt_cd={rt_cd} msg_cd={msg_cd} msg={msg1}"
+                )
+                return {
+                    "success": False,
+                    "order_id": "",
+                    "message": msg1,
+                    "raw": data,
+                    "http_status": http_status,
+                }
+        except KISTokenError:
+            raise
         except Exception as e:
             logger.error(f"[KIS-{self.mode.upper()}] 주문 예외: {e}")
-            return {"success": False, "order_id": "", "message": str(e), "raw": {}}
+            return {
+                "success": False,
+                "order_id": "",
+                "message": str(e),
+                "raw": {},
+                "http_status": 0,
+            }
 
 
 def create_kis_client(mode: str = "mock") -> "KISClient | None":

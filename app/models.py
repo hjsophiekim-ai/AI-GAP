@@ -157,6 +157,9 @@ class OrderResult:
     message: str
     raw: dict = field(default_factory=dict)
     timestamp: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    http_status: int = 0
+    error_type: str = ""
+    excluded_reason: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -172,6 +175,9 @@ class OrderResult:
             "order_id": self.order_id,
             "message": self.message,
             "timestamp": self.timestamp,
+            "http_status": self.http_status,
+            "error_type": self.error_type,
+            "excluded_reason": self.excluded_reason,
         }
 
 

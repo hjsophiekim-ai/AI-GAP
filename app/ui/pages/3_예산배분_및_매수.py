@@ -24,7 +24,8 @@ except ImportError:
 try:
     from app.trading.budget_allocator import BudgetAllocator
     from app.trading.broker_factory import create_broker
-    from app.trading.order_manager import OrderManager
+    from app.trading.order_manager import OrderManager, _is_etf_like
+    from app.trading.kis_client import KISTokenError
     from app.config import get_config
     from app.utils.stock_utils import format_amount, format_price
 except Exception as e:
@@ -59,7 +60,6 @@ def _safe_create_broker(cfg, mode, confirm_text="", runtime_real_mode=False,
 # ---------------------------------------------------------------------------
 
 def _vs_to_candidate(d: dict, rank: int = None):
-    """Volume spike dict → SimpleNamespace (BudgetAllocator 속성 호환)."""
     return types.SimpleNamespace(
         rank=rank if rank is not None else int(d.get("rank", 0)),
         symbol=str(d.get("symbol", "")),
@@ -73,7 +73,6 @@ def _vs_to_candidate(d: dict, rank: int = None):
 
 
 def _load_vs_csv_today() -> list:
-    """오늘 날짜 volume_spike Top10 CSV 로드 → SimpleNamespace 리스트."""
     date_str = datetime.now(_KST).strftime("%Y%m%d")
     csv_path = (
         Path(__file__).resolve().parent.parent.parent.parent
@@ -98,6 +97,116 @@ def _load_vs_csv_today() -> list:
         return result
     except Exception:
         return []
+
+
+def _show_buy_results(results, log_path=None):
+    """매수 결과 공통 표시 함수."""
+    success_count = sum(1 for r in results if r.success)
+    fail_count = sum(1 for r in results if not r.success and not r.excluded_reason
+                     and r.error_type not in ("excluded_etf", "duplicate", "validation_error", "batch_aborted"))
+    etf_count = sum(1 for r in results if r.error_type == "excluded_etf")
+    skip_count = sum(1 for r in results if r.error_type in ("duplicate", "validation_error", "batch_aborted"))
+    token_error = any(r.error_type == "token_403" for r in results)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("매수 성공", f"{success_count}건")
+    c2.metric("매수 실패", f"{fail_count}건")
+    c3.metric("ETF 제외", f"{etf_count}건")
+    c4.metric("스킵", f"{skip_count}건")
+
+    if token_error:
+        st.error(
+            "tokenP 403 오류 발생 — 배치가 중단되었습니다.  \n"
+            "KIS 앱키/시크릿이 올바른지, 하루 1회 이상 호출하지 않았는지 확인하세요."
+        )
+
+    # 상세 결과 테이블
+    result_rows = []
+    for r in results:
+        if r.excluded_reason:
+            status_label = "ETF제외"
+        elif r.error_type == "batch_aborted":
+            status_label = "중단"
+        elif r.error_type in ("duplicate", "validation_error"):
+            status_label = "스킵"
+        elif r.success:
+            status_label = "성공"
+        else:
+            status_label = "실패"
+
+        result_rows.append({
+            "종목코드": r.symbol,
+            "종목명": r.name,
+            "수량": r.quantity,
+            "가격": format_price(r.price),
+            "주문번호": r.order_id,
+            "결과": status_label,
+            "오류유형": r.error_type,
+            "메시지": r.message[:60] if not r.success else "",
+        })
+
+    if result_rows:
+        def _hl(row):
+            label = str(row.get("결과", ""))
+            if label == "성공":
+                color = "#d4edda"
+            elif label in ("ETF제외", "스킵", "중단"):
+                color = "#fff3cd"
+            else:
+                color = "#f8d7da"
+            return [f"background-color:{color}"] * len(row)
+
+        df_res = pd.DataFrame(result_rows)
+        st.dataframe(df_res.style.apply(_hl, axis=1), use_container_width=True, hide_index=True)
+
+    # 실패 이유 요약
+    failures = [r for r in results if not r.success and r.error_type not in
+                ("excluded_etf", "duplicate", "validation_error", "batch_aborted")]
+    if failures:
+        with st.expander(f"실패 상세 ({len(failures)}건)", expanded=True):
+            for r in failures:
+                st.markdown(
+                    f"- **{r.symbol} {r.name}**: "
+                    f"`{r.error_type}` HTTP {r.http_status} — {r.message}"
+                )
+
+    # ETF 제외 목록
+    etf_excluded = [r for r in results if r.error_type == "excluded_etf"]
+    if etf_excluded:
+        with st.expander(f"ETF/지수상품 제외 목록 ({len(etf_excluded)}건)"):
+            for r in etf_excluded:
+                st.markdown(f"- {r.symbol} **{r.name}**: {r.excluded_reason}")
+
+    # 로그 다운로드
+    if log_path:
+        try:
+            with open(log_path, "rb") as f:
+                log_bytes = f.read()
+            st.download_button(
+                label="주문 로그 CSV 다운로드",
+                data=log_bytes,
+                file_name=Path(log_path).name,
+                mime="text/csv",
+                key=f"dl_log_{hash(log_path)}",
+            )
+        except Exception:
+            st.caption(f"주문 로그: {log_path}")
+
+    # 결과 요약 메시지
+    if results and all(r.success for r in results if r.error_type == ""):
+        st.balloons()
+        st.success("모든 매수 주문 완료!")
+    elif success_count > 0:
+        st.warning(f"{success_count}개 성공 / {fail_count}개 실패 / {etf_count}개 ETF 제외")
+    elif etf_count == len(results):
+        st.warning("모든 종목이 ETF/지수상품으로 제외되었습니다.")
+    else:
+        st.error("매수 주문이 모두 실패했습니다.")
+
+
+# ===========================================================================
+# Page layout
+# ===========================================================================
 
 st.title("예산 배분 및 매수")
 
@@ -180,6 +289,22 @@ with st.expander("브로커 상태 확인", expanded=False):
     s2.metric("실전모드", "ON" if _runtime_real_mode else "OFF")
     s3.metric("실전매수", "허용" if _runtime_enable_real_buy else "차단")
     s4.metric("실전매도", "허용" if _runtime_enable_real_sell else "차단")
+
+    # 토큰 캐시 상태
+    try:
+        from pathlib import Path as _Path
+        import json as _json
+        _repo_root = _Path(__file__).resolve().parent.parent.parent.parent
+        _cache_path = _repo_root / "data" / "cache" / f"kis_token_{selected_mode}.json"
+        if _cache_path.exists():
+            with open(_cache_path) as _f:
+                _cdata = _json.load(_f)
+            _exp = _cdata.get("expires_at", "")
+            st.caption(f"토큰 캐시: {selected_mode} — 만료 {_exp[:19] if _exp else '알 수 없음'}")
+        else:
+            st.caption(f"토큰 캐시: {selected_mode} — 없음 (첫 매수 시 발급)")
+    except Exception:
+        st.caption("토큰 캐시 상태 조회 실패")
     st.caption("※ API 키/계좌번호 등 민감정보는 표시하지 않습니다.")
 
 st.divider()
@@ -217,17 +342,18 @@ with col_load1:
 
 top15 = st.session_state.get("top15", [])
 if top15:
-    rows = [
-        {
+    rows = []
+    for c in top15:
+        etf_flag = _is_etf_like(c.symbol, c.name)
+        rows.append({
             "순위": c.rank,
             "종목코드": c.symbol,
             "종목명": c.name,
             "현재가": format_price(c.current_price),
             "상승률(%)": f"{c.change_rate:.2f}",
             "최종점수": f"{c.final_score:.2f}",
-        }
-        for c in top15
-    ]
+            "ETF제외": "⚠️ ETF/지수" if etf_flag else "",
+        })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 st.divider()
@@ -257,25 +383,28 @@ with col_alloc1:
 
 buy_plan = st.session_state.get("buy_plan", [])
 if buy_plan:
-    rows = [
-        {
+    rows = []
+    for p in buy_plan:
+        etf_flag = _is_etf_like(p.symbol, p.name)
+        rows.append({
             "순위": p.rank,
             "종목코드": p.symbol,
             "종목명": p.name,
             "현재가": format_price(p.current_price),
             "배분수량": p.allocated_quantity,
             "배분금액": format_amount(p.allocated_amount),
-        }
-        for p in buy_plan
-    ]
+            "ETF제외": "⚠️" if etf_flag else "",
+        })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     total_invested = sum(p.allocated_amount for p in buy_plan)
     remaining = float(total_budget) - total_invested
-    m1, m2, m3 = st.columns(3)
+    etf_in_plan = sum(1 for p in buy_plan if _is_etf_like(p.symbol, p.name))
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("배분 종목", f"{len(buy_plan)}개")
     m2.metric("총 투자금", format_amount(total_invested))
     m3.metric("잔여 예산", format_amount(remaining))
+    m4.metric("ETF 제외 예정", f"{etf_in_plan}개")
 
 st.divider()
 
@@ -300,6 +429,7 @@ real_confirm_ok = (
 )
 
 _execute_buy = False
+_selected_plan_for_buy = buy_plan  # 기본값: 전체
 
 # ── 수동 매수 ──────────────────────────────────────────────────────────────
 if buy_type == "수동 매수":
@@ -320,10 +450,9 @@ if buy_type == "수동 매수":
 
 # ── 9:20 일괄매수 예약 ────────────────────────────────────────────────────
 elif buy_type == "9:20 일괄매수 (예약)":
-    # Render 서버는 UTC로 동작하므로 반드시 KST(UTC+9) 명시
     now = datetime.now(_KST)
     h, m = now.hour, now.minute
-    is_920 = (h == 9 and 18 <= m <= 22)  # 9:18~9:22 허용 범위
+    is_920 = (h == 9 and 18 <= m <= 22)
 
     col_time, col_refresh = st.columns([4, 1])
     with col_time:
@@ -386,65 +515,8 @@ elif buy_type == "종목 선택 매수":
                 use_container_width=True,
                 key="btn_sel_buy",
             ):
-                try:
-                    cfg = get_config()
-                    with st.spinner("브로커 초기화 중..."):
-                        broker = _safe_create_broker(
-                            cfg=cfg, mode=selected_mode,
-                            confirm_text=confirm_text,
-                            runtime_real_mode=_runtime_real_mode,
-                            runtime_enable_real_buy=_runtime_enable_real_buy,
-                            runtime_enable_real_sell=_runtime_enable_real_sell,
-                        )
-                    order_manager = OrderManager(broker=broker, cfg=cfg)
-
-                    with st.spinner(f"{len(selected_plan)}개 종목 매수 중..."):
-                        sel_results = order_manager.execute_buy_plans(selected_plan)
-
-                    st.session_state["buy_results"] = sel_results
-                    try:
-                        log_path = order_manager.save_order_log(sel_results)
-                        st.caption(f"주문 로그: {log_path}")
-                    except Exception:
-                        pass
-
-                    result_rows = [
-                        {
-                            "종목코드": r.symbol,
-                            "종목명": r.name,
-                            "수량": r.quantity,
-                            "가격": format_price(r.price),
-                            "주문번호": r.order_id,
-                            "결과": "성공" if r.success else "실패",
-                            "메시지": r.message,
-                        }
-                        for r in sel_results
-                    ]
-                    if result_rows:
-                        def _hl_sel(row):
-                            color = "#d4edda" if "성공" in str(row["결과"]) else "#f8d7da"
-                            return [f"background-color:{color}"] * len(row)
-                        df_sel = pd.DataFrame(result_rows)
-                        st.dataframe(df_sel.style.apply(_hl_sel, axis=1), use_container_width=True, hide_index=True)
-
-                    success_count = sum(1 for r in sel_results if r.success)
-                    fail_count = len(sel_results) - success_count
-                    rc1, rc2 = st.columns(2)
-                    rc1.metric("매수 성공", success_count)
-                    rc2.metric("매수 실패", fail_count)
-
-                    if sel_results and all(r.success for r in sel_results):
-                        st.balloons()
-                        st.success("선택 종목 매수 완료!")
-                    elif success_count > 0:
-                        st.warning(f"{success_count}개 성공 / {fail_count}개 실패")
-                    else:
-                        st.error("매수 주문이 모두 실패했습니다.")
-
-                except RuntimeError as e:
-                    st.error(f"안전장치 차단: {e}")
-                except Exception as e:
-                    st.error(f"브로커 생성 실패: 실전모드 설정 또는 KIS 환경변수를 확인하세요.\n상세: {e}")
+                _execute_buy = True
+                _selected_plan_for_buy = selected_plan
         else:
             st.info("위에서 매수할 종목을 선택하세요.")
 
@@ -462,50 +534,25 @@ if _execute_buy:
             )
         order_manager = OrderManager(broker=broker, cfg=cfg)
 
-        with st.spinner("매수 주문 실행 중..."):
-            results = order_manager.execute_buy_plans(buy_plan)
+        plan_to_execute = _selected_plan_for_buy
+        with st.spinner(f"{len(plan_to_execute)}개 종목 매수 중..."):
+            results = order_manager.execute_buy_plans(plan_to_execute)
 
         st.session_state["buy_results"] = results
 
+        log_path = None
         try:
             log_path = order_manager.save_order_log(results)
-            st.caption(f"주문 로그: {log_path}")
         except Exception as log_err:
             st.warning(f"로그 저장 오류: {log_err}")
 
-        result_rows = [
-            {
-                "종목코드": r.symbol,
-                "종목명": r.name,
-                "수량": r.quantity,
-                "가격": format_price(r.price),
-                "주문번호": r.order_id,
-                "결과": "성공" if r.success else "실패",
-                "메시지": r.message,
-            }
-            for r in results
-        ]
-        if result_rows:
-            def _hl(row):
-                color = "#d4edda" if "성공" in str(row["결과"]) else "#f8d7da"
-                return [f"background-color:{color}"] * len(row)
-            df_res = pd.DataFrame(result_rows)
-            st.dataframe(df_res.style.apply(_hl, axis=1), use_container_width=True, hide_index=True)
+        _show_buy_results(results, log_path=log_path)
 
-        success_count = sum(1 for r in results if r.success)
-        fail_count = len(results) - success_count
-        rc1, rc2 = st.columns(2)
-        rc1.metric("매수 성공", success_count)
-        rc2.metric("매수 실패", fail_count)
-
-        if results and all(r.success for r in results):
-            st.balloons()
-            st.success("모든 매수 주문 완료!")
-        elif success_count > 0:
-            st.warning(f"{success_count}개 성공 / {fail_count}개 실패")
-        else:
-            st.error("모든 매수 주문이 실패했습니다.")
-
+    except KISTokenError as e:
+        st.error(
+            f"토큰 오류 (403): {e}\n\n"
+            "KIS 앱키/시크릿이 올바른지, 동일 키로 당일 이미 토큰을 발급받지 않았는지 확인하세요."
+        )
     except RuntimeError as e:
         st.error(f"매수 실행 오류 (안전장치 차단): {e}")
     except Exception as e:

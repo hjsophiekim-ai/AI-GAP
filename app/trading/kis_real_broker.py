@@ -18,6 +18,7 @@ runtime_real_mode=True (UI 실전모드 버튼) 이면 gate 2~3 우회.
 """
 
 from app.trading.broker_base import BrokerBase
+from app.trading.kis_client import KISTokenError
 from app.models import OrderResult, Position
 from app.logger import logger
 
@@ -206,7 +207,10 @@ class KisRealBroker(BrokerBase):
                 order_id=result.get("order_id", ""),
                 message=result.get("message", ""),
                 raw=result.get("raw", {}),
+                http_status=result.get("http_status", 0),
             )
+        except KISTokenError:
+            raise
         except Exception as e:
             logger.error("REAL buy 예외 %s: %s", symbol, e)
             return OrderResult(
@@ -214,6 +218,7 @@ class KisRealBroker(BrokerBase):
                 symbol=symbol, name=name, side="buy",
                 quantity=quantity, price=price, order_type=order_type,
                 order_id="", message=str(e),
+                error_type="exception",
             )
 
     def sell(

@@ -44,6 +44,9 @@ ETF_ETN_KEYWORDS = [
     "KODEX", "TIGER", "ACE", "SOL", "PLUS", "KBSTAR", "KOSEF",
     "HANARO", "ARIRANG", "ETN", "ETF", "레버리지", "인버스", "선물",
     "합성", "TR", "RISE", "FOCUS", "TREX", "TIMEFOLIO", "WOORI",
+    # WON 계열 ETF / 채권·지수 상품 추가
+    "WON", "채권", "국고채", "코스피200", "코스닥150", "나스닥", "S&P",
+    "미국", "선진국", "신흥국", "글로벌", "달러",
 ]
 
 SPAC_KEYWORDS = ["스팩", "SPAC"]
