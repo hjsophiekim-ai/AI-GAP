@@ -142,6 +142,7 @@ sector_leader_top3:
   min_change_rate: 2.0
   max_change_rate: 15.0
   max_same_sector: 2
+  max_sector_rank: 5          # 섹터 거래대금 순위 5위 초과 섹터 종목은 Top3 대상 제외
   target_top_n: 3
   scoring:
     sector_strength_score_max: 35

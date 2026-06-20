@@ -165,6 +165,32 @@ class SectorLeaderTop3Selector:
         self._last_sector_analysis = sector_analysis
         diag["sectors_found"] = len(sector_analysis)
 
+        # ── Stage 3b: 섹터 순위 제한 필터 (상위 섹터 종목만) ─────────────
+        max_sector_rank = int(self._t3_cfg.get("max_sector_rank", 5))
+        sector_rank_excluded: list[dict] = []
+        eligible: list[dict] = []
+        for s in passed:
+            sec = s.get("sector", "unknown")
+            sec_rank = sector_analysis.get(sec, {}).get("sector_tv_rank", 99)
+            if sec_rank > max_sector_rank:
+                s2 = dict(s)
+                s2["excluded_reason"] = f"sector_rank_too_low({sec_rank}>{max_sector_rank})"
+                s2["sector_tv_rank"] = sec_rank
+                sector_rank_excluded.append(s2)
+            else:
+                s["sector_tv_rank"] = sec_rank
+                eligible.append(s)
+
+        excluded.extend(sector_rank_excluded)
+        diag["sector_rank_excluded"] = len(sector_rank_excluded)
+        diag["eligible_after_sector_rank"] = len(eligible)
+        passed = eligible
+
+        if len(passed) == 0:
+            logger.warning("[SectorLeaderTop3] 섹터 순위 필터 후 통과 종목 0개 → Top3 불가")
+            diag["top3_count"] = 0
+            return [], diag, excluded
+
         # ── Stage 4: 각 종목 점수 계산 ───────────────────────────────────
         scored: list[dict] = []
         for s in passed:
