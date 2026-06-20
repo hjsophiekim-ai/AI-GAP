@@ -161,7 +161,10 @@ class SectorLeaderTop3Selector:
             return [], diag, excluded
 
         # ── Stage 3: 섹터 강도 계산 ──────────────────────────────────────
-        sector_analysis = self._analyze_sectors(passed, vs_symbols)
+        # 반드시 하드 필터 이전 전체 stocks 기준으로 섹터 순위 산출.
+        # passed(필터 후)로 계산하면 경쟁 섹터 종목이 제거되어 조선업 등이
+        # 순위가 올라가는 오류 발생 (한화오션 버그의 근본 원인).
+        sector_analysis = self._analyze_sectors(stocks, vs_symbols)
         self._last_sector_analysis = sector_analysis
         diag["sectors_found"] = len(sector_analysis)
 

@@ -323,7 +323,8 @@ class USSectorStrengthService:
     # ------------------------------------------------------------------
 
     def _fetch_yahoo_etf_changes(self, symbols: list[str]) -> dict[str, dict]:
-        """Yahoo Finance에서 ETF 등락률을 수집한다.
+        """Yahoo Finance v8 chart JSON API로 ETF 등락률 수집.
+        JSON 파싱 실패 시 HTML quote 페이지로 폴백.
 
         Returns {symbol: {"change_pct": float|None, "success": bool, "error": str}}
         """
@@ -334,6 +335,27 @@ class USSectorStrengthService:
         session.headers.update(_HEADERS)
 
         for symbol in symbols:
+            # 1차: v8 chart JSON API (더 안정적 — SPA 렌더링 불필요)
+            try:
+                url = (
+                    f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+                    f"?interval=1d&range=5d&includePrePost=false"
+                )
+                resp = session.get(url, timeout=timeout)
+                if resp.status_code == 200:
+                    change_pct = self._parse_yahoo_v8_json(resp.text, symbol)
+                    if change_pct is not None:
+                        results[symbol] = {"change_pct": change_pct, "success": True, "error": ""}
+                        time.sleep(0.15)
+                        continue
+                    # JSON 파싱 실패 → HTML 폴백
+                elif resp.status_code in (429, 503):
+                    # 요청 제한 → 잠시 대기 후 HTML 폴백
+                    time.sleep(1.0)
+            except Exception as exc:
+                logger.debug("[USSectorStrength] %s v8 API 오류: %s", symbol, exc)
+
+            # 2차: HTML quote 페이지 폴백
             try:
                 url = f"https://finance.yahoo.com/quote/{symbol}/"
                 resp = session.get(url, timeout=timeout)
@@ -345,7 +367,10 @@ class USSectorStrengthService:
                     }
                     continue
                 change_pct = self._parse_yahoo_change(resp.text, symbol)
-                results[symbol] = {"change_pct": change_pct, "success": True, "error": ""}
+                if change_pct is not None:
+                    results[symbol] = {"change_pct": change_pct, "success": True, "error": ""}
+                else:
+                    results[symbol] = {"change_pct": None, "success": False, "error": "html_parse_failed"}
                 time.sleep(0.3)
             except Exception as exc:
                 results[symbol] = {
@@ -353,14 +378,35 @@ class USSectorStrengthService:
                     "success": False,
                     "error": str(exc)[:100],
                 }
-                continue
 
         ok_count = sum(1 for r in results.values() if r["success"])
         logger.info("[USSectorStrength] Yahoo 수집 완료: %d/%d", ok_count, len(symbols))
         return results
 
-    def _parse_yahoo_change(self, html: str, symbol: str) -> float:
-        """HTML에서 regularMarketChangePercent를 파싱한다."""
+    def _parse_yahoo_v8_json(self, text: str, symbol: str) -> Optional[float]:
+        """Yahoo Finance v8 chart JSON 응답에서 등락률 계산.
+
+        Returns None if parsing fails — caller must treat as failure (not 0%).
+        """
+        try:
+            data = json.loads(text)
+            result = data.get("chart", {}).get("result")
+            if not result:
+                return None
+            meta = result[0].get("meta", {})
+            price = meta.get("regularMarketPrice")
+            prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+            if price and prev and float(prev) > 0:
+                return round((float(price) - float(prev)) / float(prev) * 100.0, 3)
+        except Exception as exc:
+            logger.debug("[USSectorStrength] %s v8 JSON 파싱 오류: %s", symbol, exc)
+        return None
+
+    def _parse_yahoo_change(self, html: str, symbol: str) -> Optional[float]:
+        """HTML에서 regularMarketChangePercent를 파싱한다.
+
+        Returns None if all patterns fail — caller must treat as failure (not 0%).
+        """
         m = re.search(r'"regularMarketChangePercent"\s*:\s*\{"raw"\s*:\s*([-\d.]+)', html)
         if m:
             return float(m.group(1))
@@ -384,8 +430,8 @@ class USSectorStrengthService:
             if prev > 0:
                 return (curr - prev) / prev * 100.0
 
-        logger.debug("[USSectorStrength] %s 등락률 파싱 실패", symbol)
-        return 0.0
+        logger.debug("[USSectorStrength] %s HTML 등락률 파싱 실패", symbol)
+        return None  # 0.0 반환 금지 — 파싱 실패는 실패로 처리해야 함
 
     def _compute_sector_scores(
         self,
