@@ -1,8 +1,88 @@
 # AI-GAP 프로젝트 요구사항 명세서
 
-버전: 1.0  
-작성일: 2026-06-16  
+버전: 2.0  
+작성일: 2026-06-20  
 작성자: AI-GAP 개발팀
+
+---
+
+## 변경 이력
+
+| 버전 | 날짜 | 내용 |
+|------|------|------|
+| 2.0 | 2026-06-20 | 주도섹터 Top3 전략 추가, 미국장 섹터 자동 분석 기능 추가 |
+| 1.0 | 2026-06-16 | 최초 작성 (거래량 급증 Top10 전략) |
+
+---
+
+## 1.6 주도섹터 Top3 전략 (Sector Leader Top3 Strategy) ★ 신규
+
+**당일 주도섹터 + 대장주 + 거래대금/거래량 확인 기반 Top3 집중매수 전략.**
+
+> `strategy.mode = "sector_leader_top3"` 설정 시 활성화.
+
+### 데이터 소스
+
+| 소스 | URL | 시간 | 용도 |
+|------|-----|------|------|
+| NXT 거래대금 | `https://finance.naver.com/sise/sise_quant.naver` | 08:00+ | 주 데이터, 섹터별 거래대금 집계 |
+| 거래량 급증 | `https://finance.naver.com/sise/sise_quant_high.naver` | 09:00+ | 보조 확인, volume_spike_confirm_score |
+| Yahoo Finance ETF | `https://finance.yahoo.com/quote/{ETF}/` | 전날 | 미국 섹터 강도 자동 분석 |
+| 캐시 | `data/cache/us_sector_strength_YYYYMMDD.json` | 24h 유효 | Yahoo 파싱 실패 시 fallback |
+
+### 점수 산식
+
+```
+final_score = sector_strength_score(max 35)
+            + sector_leader_score(max 25)
+            + us_sector_match_score(max 20)
+            + volume_spike_confirm_score(max 10)
+            + ma_bonus(max 10)
+            - risk_penalty(max 30)
+```
+
+### 하드 제외 (fallback에서도 절대 복구 금지)
+
+- 현재가 20,000원 미만 / 거래대금 20억 미만
+- 상승률 2% 미만 또는 15% 초과
+- ETF / ETN / 우선주 / 스팩 / 리츠 / 거래정지
+
+### 미국장 섹터 자동 분석
+
+- **모듈**: `app/services/us_sector_strength_service.py`
+- **소스 우선순위**: Yahoo Finance ETF quote → 캐시 → 0점 처리 (프로그램 중단 없음)
+- **시장 레짐**: risk_on(SPY/QQQ 모두 양수) | neutral | risk_off(SPY/QQQ 모두 -0.3% 이하)
+- **risk_off 시**: us_sector_match_score 50% 축소, UI 경고 표시
+
+### Top3 선정 규칙
+
+1. final_score 상위 3개 선정
+2. 동일 섹터 최대 2개 허용
+3. 1위: 가장 강한 섹터의 대장주
+4. 후보 부족 시 fallback (상승률 1%+, 가격 10,000원+ 완화)
+
+### 신규 모듈
+
+| 파일 | 역할 |
+|------|------|
+| `app/data/naver_nxt_turnover_collector.py` | NXT 거래대금 수집 (cp949→euc-kr→utf-8 fallback) |
+| `app/strategy/sector_mapper.py` | 종목→섹터 매핑 (symbol_overrides > 업종명 > 키워드) |
+| `app/strategy/sector_strength_analyzer.py` | 섹터 강도 계산 |
+| `app/strategy/sector_leader_top3_selector.py` | Top3 선정 |
+| `app/services/us_sector_strength_service.py` | 미국장 섹터 자동 분석 |
+| `app/ui/pages/6_주도섹터_Top3.py` | Streamlit UI |
+| `config/kr_sector_map.yaml` | 16섹터 종목코드/키워드 매핑 |
+| `tests/test_sector_leader_top3.py` | 40개 단위 테스트 |
+
+### 기존 전략 호환
+
+| `strategy.mode` | 사용 전략 |
+|----------------|---------|
+| `"gap"` | 기존 갭상승 Top15 |
+| `"volume_spike"` | 기존 거래량급증 Top10 |
+| `"sector_leader_top3"` | **신규** 주도섹터 Top3 |
+
+---
 
 ---
 

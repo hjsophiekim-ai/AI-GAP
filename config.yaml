@@ -121,6 +121,46 @@ volume_spike:
   quality_stock_preference: true
   max_candidates_to_score: 80
 
+strategy:
+  mode: "volume_spike"  # gap | volume_spike | sector_leader_top3
+
+sector_leader_top3:
+  enabled: true
+  use_us_sector_match: true
+  nxt_max_pages: 5
+  nxt_max_stocks: 100
+  volume_spike_max_pages: 3
+  volume_spike_max_stocks: 80
+  exclude_etf: true
+  exclude_etn: true
+  exclude_preferred: true
+  exclude_spac: true
+  exclude_reit: true
+  exclude_suspended: true
+  min_price: 20000
+  min_trading_value: 2000000000
+  min_change_rate: 2.0
+  max_change_rate: 15.0
+  max_same_sector: 2
+  target_top_n: 3
+  scoring:
+    sector_strength_score_max: 35
+    sector_leader_score_max: 25
+    us_sector_match_score_max: 20
+    volume_spike_confirm_score_max: 10
+    ma_bonus_max: 10
+    risk_penalty_max: 30
+
+us_sector_strength:
+  enabled: true
+  primary_source: "yahoo"
+  fallback_sources: ["cache"]
+  cache_enabled: true
+  cache_max_age_hours: 24
+  strong_threshold: 70
+  moderate_threshold: 50
+  request_timeout_seconds: 8
+
 logging:
   save_csv: true
   save_db: false
