@@ -9,6 +9,10 @@ us_sector_strength_service.py
 3. 데이터 없음 → us_sector_match_score=0 처리
 
 캐시 유효기간: 24시간
+
+ETF 수집 상태:
+  ok            : 섹터 ETF 5개 이상 성공
+  partial_failed: 섹터 ETF 5개 미만 → strong_sectors=[], score=0
 """
 
 from __future__ import annotations
@@ -45,6 +49,7 @@ ETF_SECTOR_MAP: dict[str, str] = {
     "META": "ai_data_center",
     "XLU": "power_grid",
     "NEE": "power_grid",
+    "URA": "power_grid",      # uranium/nuclear energy → power_grid
     "ITA": "defense",
     "LMT": "defense",
     "RTX": "defense",
@@ -58,11 +63,13 @@ ETF_SECTOR_MAP: dict[str, str] = {
     "CAT": "industrials",
     "XLV": "healthcare_bio",
     "XLY": "consumer_discretionary",
+    "XLP": "consumer_staples",
     "XLE": "energy",
     "XLF": "financials",
     "XLB": "materials_copper",
     "COPX": "materials_copper",
     "FCX": "materials_copper",
+    "XLRE": "real_estate",
     "SPY": "_benchmark",
     "QQQ": "_benchmark",
     "IWM": "_benchmark",
@@ -88,22 +95,31 @@ DOMESTIC_TO_US_SECTOR_MAP: dict[str, Optional[str]] = {
     "unknown": None,
 }
 
-# ETF symbols to fetch (benchmarks + sector leaders)
+# Full ETF universe (benchmarks + sector ETFs)
 _ALL_SYMBOLS = [
-    "SPY", "QQQ",
-    "SMH", "SOXX",
-    "XLK", "XLC",
-    "XLU",
-    "ITA",
-    "BOTZ",
-    "LIT",
-    "XLI",
-    "XLV",
-    "XLY",
-    "XLE",
-    "XLF",
-    "XLB", "COPX",
+    "SPY", "QQQ",          # benchmarks — regime only, NOT sector scoring
+    "SMH", "SOXX",         # semiconductor
+    "XLK", "XLC",          # tech / ai_data_center
+    "XLU",                 # utilities / power_grid
+    "ITA",                 # defense
+    "BOTZ",                # robotics
+    "LIT",                 # battery_ev
+    "XLI",                 # industrials
+    "XLV",                 # healthcare_bio
+    "XLY",                 # consumer_discretionary
+    "XLE",                 # energy
+    "XLF",                 # financials
+    "XLB", "COPX",         # materials_copper
+    "XLRE",                # real_estate
+    "URA",                 # uranium/nuclear → power_grid
+    "XLP",                 # consumer_staples
 ]
+
+# Symbols used only for regime detection, not sector scoring
+_REGIME_ONLY: set[str] = {"SPY", "QQQ"}
+
+# Minimum number of sector ETFs (non-benchmark) that must succeed for "ok" status
+_SECTOR_MIN_OK = 5
 
 _HEADERS = {
     "User-Agent": (
@@ -147,23 +163,24 @@ class USSectorStrengthService:
         전날 미국장 섹터 강도를 반환한다.
 
         Returns dict with:
-          market_regime, data_source_used, strong_sectors, moderate_sectors,
-          sector_scores, sector_etf_changes, spy_change, qqq_change, collected_at
+          market_regime, data_source_used, us_sector_data_status,
+          successful_etf_count, failed_etfs,
+          strong_sectors, moderate_sectors, sector_scores,
+          sector_etf_changes, spy_change, qqq_change, collected_at
         """
         cache_enabled = self._us_cfg.get("cache_enabled", True)
 
         # 1. Try Yahoo Finance
         try:
-            etf_changes = self._fetch_yahoo_etf_changes(_ALL_SYMBOLS)
+            etf_results = self._fetch_yahoo_etf_changes(_ALL_SYMBOLS)
         except Exception as exc:
             logger.warning("[USSectorStrength] Yahoo 수집 오류: %s", exc)
-            etf_changes = {}
+            etf_results = {}
 
-        if etf_changes:
-            spy = etf_changes.get("SPY", 0.0)
-            qqq = etf_changes.get("QQQ", 0.0)
-            sector_result = self._build_result(etf_changes, spy, qqq, "yahoo")
-            if cache_enabled:
+        if etf_results:
+            sector_result = self._compute_from_etf_results(etf_results)
+            sector_result["data_source_used"] = "yahoo"
+            if cache_enabled and sector_result.get("us_sector_data_status") == "ok":
                 self._save_cache(sector_result)
             return sector_result
 
@@ -194,6 +211,9 @@ class USSectorStrengthService:
         if not us_result or us_result.get("data_source_used") == "none":
             return (0, "", "no_us_data")
 
+        if us_result.get("us_sector_data_status") == "partial_failed":
+            return (0, "", "sector_etf_data_missing")
+
         us_key = DOMESTIC_TO_US_SECTOR_MAP.get(domestic_sector)
         if not us_key:
             return (0, "", "no_us_mapping")
@@ -218,12 +238,96 @@ class USSectorStrengthService:
         return (base_score, us_key, reason)
 
     # ------------------------------------------------------------------
+    # Core computation (unit-testable)
+    # ------------------------------------------------------------------
+
+    def _compute_from_etf_results(self, etf_results: dict) -> dict:
+        """
+        etf_results: {symbol: {"change_pct": float|None, "success": bool, "error": str}}
+
+        섹터 ETF 5개 미만 성공 → partial_failed (strong_sectors=[]).
+        SPY/QQQ는 regime 전용, sector scoring에서 제외.
+        """
+        spy_info = etf_results.get("SPY", {})
+        qqq_info = etf_results.get("QQQ", {})
+        spy_change = (spy_info.get("change_pct") or 0.0)
+        qqq_change = (qqq_info.get("change_pct") or 0.0)
+
+        sector_etfs_ok = {
+            sym: info for sym, info in etf_results.items()
+            if sym not in _REGIME_ONLY and info.get("success") and info.get("change_pct") is not None
+        }
+        failed_etfs = [sym for sym, info in etf_results.items() if not info.get("success")]
+
+        regime = self._determine_market_regime(spy_change, qqq_change)
+
+        if len(sector_etfs_ok) < _SECTOR_MIN_OK:
+            result = self._empty_result()
+            result.update({
+                "us_sector_data_status": "partial_failed",
+                "successful_etf_count": len(sector_etfs_ok),
+                "failed_etfs": failed_etfs,
+                "market_regime": regime,
+                "spy_change": round(spy_change, 3),
+                "qqq_change": round(qqq_change, 3),
+                "strong_sectors": [],
+                "moderate_sectors": [],
+            })
+            logger.warning(
+                "[USSectorStrength] 섹터 ETF %d개만 성공 (최소 %d개 필요) → partial_failed",
+                len(sector_etfs_ok), _SECTOR_MIN_OK,
+            )
+            return result
+
+        # Build flat change dict for scoring
+        etf_changes = {
+            sym: info["change_pct"]
+            for sym, info in etf_results.items()
+            if info.get("success") and info.get("change_pct") is not None
+        }
+
+        sector_scores = self._compute_sector_scores(etf_changes, spy_change, qqq_change)
+        strong_threshold = float(self._us_cfg.get("strong_threshold", 70))
+        moderate_threshold = float(self._us_cfg.get("moderate_threshold", 50))
+
+        strong = [
+            s for s, sc in sorted(sector_scores.items(), key=lambda x: -x[1])
+            if sc >= strong_threshold
+        ]
+        moderate = [
+            s for s, sc in sorted(sector_scores.items(), key=lambda x: -x[1])
+            if moderate_threshold <= sc < strong_threshold
+        ]
+
+        return {
+            "market_regime": regime,
+            "data_source_used": "yahoo",
+            "us_sector_data_status": "ok",
+            "successful_etf_count": len(sector_etfs_ok),
+            "failed_etfs": failed_etfs,
+            "strong_sectors": strong,
+            "moderate_sectors": moderate,
+            "sector_scores": sector_scores,
+            "sector_etf_changes": {
+                sym: round(info["change_pct"], 3)
+                for sym, info in etf_results.items()
+                if info.get("success") and info.get("change_pct") is not None
+            },
+            "spy_change": round(spy_change, 3),
+            "qqq_change": round(qqq_change, 3),
+            "collected_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _fetch_yahoo_etf_changes(self, symbols: list[str]) -> dict[str, float]:
-        """Yahoo Finance에서 ETF 등락률을 수집한다."""
-        results: dict[str, float] = {}
+    def _fetch_yahoo_etf_changes(self, symbols: list[str]) -> dict[str, dict]:
+        """Yahoo Finance에서 ETF 등락률을 수집한다.
+
+        Returns {symbol: {"change_pct": float|None, "success": bool, "error": str}}
+        """
+        results: dict[str, dict] = {}
         timeout = int(self._us_cfg.get("request_timeout_seconds", 8))
 
         session = requests.Session()
@@ -234,31 +338,37 @@ class USSectorStrengthService:
                 url = f"https://finance.yahoo.com/quote/{symbol}/"
                 resp = session.get(url, timeout=timeout)
                 if resp.status_code != 200:
-                    logger.debug("[USSectorStrength] %s HTTP %s", symbol, resp.status_code)
+                    results[symbol] = {
+                        "change_pct": None,
+                        "success": False,
+                        "error": f"http_{resp.status_code}",
+                    }
                     continue
                 change_pct = self._parse_yahoo_change(resp.text, symbol)
-                results[symbol] = change_pct
+                results[symbol] = {"change_pct": change_pct, "success": True, "error": ""}
                 time.sleep(0.3)
             except Exception as exc:
-                logger.debug("[USSectorStrength] %s 파싱 오류: %s", symbol, exc)
+                results[symbol] = {
+                    "change_pct": None,
+                    "success": False,
+                    "error": str(exc)[:100],
+                }
                 continue
 
-        logger.info("[USSectorStrength] Yahoo 수집 완료: %d/%d", len(results), len(symbols))
+        ok_count = sum(1 for r in results.values() if r["success"])
+        logger.info("[USSectorStrength] Yahoo 수집 완료: %d/%d", ok_count, len(symbols))
         return results
 
     def _parse_yahoo_change(self, html: str, symbol: str) -> float:
         """HTML에서 regularMarketChangePercent를 파싱한다."""
-        # Pattern 1: JSON raw value in page data
         m = re.search(r'"regularMarketChangePercent"\s*:\s*\{"raw"\s*:\s*([-\d.]+)', html)
         if m:
             return float(m.group(1))
 
-        # Pattern 2: data attribute in HTML
         m = re.search(r'data-field="regularMarketChangePercent"[^>]*data-value="([-\d.]+)"', html)
         if m:
             return float(m.group(1))
 
-        # Pattern 3: fin-streamer tag
         m = re.search(
             r'<fin-streamer[^>]*data-field="regularMarketChangePercent"[^>]*value="([-\d.]+)"',
             html,
@@ -266,7 +376,6 @@ class USSectorStrengthService:
         if m:
             return float(m.group(1))
 
-        # Pattern 4: compute from previousClose and regularMarketPrice
         prev_m = re.search(r'"regularMarketPreviousClose"\s*:\s*\{"raw"\s*:\s*([\d.]+)', html)
         curr_m = re.search(r'"regularMarketPrice"\s*:\s*\{"raw"\s*:\s*([\d.]+)', html)
         if prev_m and curr_m:
@@ -291,50 +400,20 @@ class USSectorStrengthService:
             if sec and not sec.startswith("_"):
                 sector_avgs.setdefault(sec, []).append(chg)
 
-        # Compute average per sector
         sector_avg: dict[str, float] = {
             s: sum(vals) / len(vals) for s, vals in sector_avgs.items()
         }
 
-        # Relative strength vs SPY
         rel_strength: dict[str, float] = {
             s: avg - spy_change for s, avg in sector_avg.items()
         }
 
-        # Normalize to 0-100 (spy baseline = 50)
         scores: dict[str, float] = {}
         for sec, rel in rel_strength.items():
-            # rel < -3 → ~0,  rel = 0 → 50,  rel > 3 → ~100
             normalized = max(0.0, min(100.0, 50.0 + rel * 16.67))
             scores[sec] = round(normalized, 1)
 
         return scores
-
-    def _build_result(
-        self,
-        etf_changes: dict[str, float],
-        spy_change: float,
-        qqq_change: float,
-        source: str,
-    ) -> dict:
-        sector_scores = self._compute_sector_scores(etf_changes, spy_change, qqq_change)
-        strong_threshold = float(self._us_cfg.get("strong_threshold", 70))
-        moderate_threshold = float(self._us_cfg.get("moderate_threshold", 50))
-
-        strong = [s for s, sc in sorted(sector_scores.items(), key=lambda x: -x[1]) if sc >= strong_threshold]
-        moderate = [s for s, sc in sorted(sector_scores.items(), key=lambda x: -x[1]) if moderate_threshold <= sc < strong_threshold]
-
-        return {
-            "market_regime": self._determine_market_regime(spy_change, qqq_change),
-            "data_source_used": source,
-            "strong_sectors": strong,
-            "moderate_sectors": moderate,
-            "sector_scores": sector_scores,
-            "sector_etf_changes": {k: round(v, 3) for k, v in etf_changes.items()},
-            "spy_change": round(spy_change, 3),
-            "qqq_change": round(qqq_change, 3),
-            "collected_at": datetime.now().isoformat(timespec="seconds"),
-        }
 
     def _determine_market_regime(self, spy: float, qqq: float) -> str:
         if spy > 0 and qqq > 0:
@@ -347,6 +426,9 @@ class USSectorStrengthService:
         return {
             "market_regime": "neutral",
             "data_source_used": "none",
+            "us_sector_data_status": "no_data",
+            "successful_etf_count": 0,
+            "failed_etfs": [],
             "strong_sectors": [],
             "moderate_sectors": [],
             "sector_scores": {},
@@ -365,7 +447,6 @@ class USSectorStrengthService:
         try:
             with open(cache_file, encoding="utf-8") as f:
                 data = json.load(f)
-            # Check age
             collected_at = datetime.fromisoformat(data.get("collected_at", "2000-01-01"))
             max_age = int(self._us_cfg.get("cache_max_age_hours", 24))
             if datetime.now() - collected_at > timedelta(hours=max_age):

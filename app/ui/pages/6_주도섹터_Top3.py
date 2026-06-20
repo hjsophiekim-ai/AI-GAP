@@ -357,3 +357,46 @@ if st.session_state.get("sl_top3") is not None:
             st.dataframe(pd.DataFrame(excl_rows), use_container_width=True, hide_index=True)
         else:
             st.caption("제외 종목 없음")
+
+    st.divider()
+
+    # ── 진단 정보 (Debug) ──────────────────────────────────────────────────
+    with st.expander("진단 정보 (Debug)", expanded=False):
+        st.subheader("선정 파이프라인 통계")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("NXT 수집", diag.get("total_nxt", 0))
+        d2.metric("하드 제외", diag.get("hard_excluded", 0))
+        d3.metric("평가 대상 (eligible)", diag.get("candidates_evaluated", diag.get("after_hard_filter", 0)))
+        d4.metric("섹터 수", diag.get("sectors_found", 0))
+
+        d5, d6 = st.columns(2)
+        d5.metric("Fallback 사용", "✅" if diag.get("fallback_used") else "❌")
+        d6.metric("최종 Top3", diag.get("top3_count", 0))
+
+        st.subheader("미국 ETF 데이터 진단")
+        us_status = us_result.get("us_sector_data_status", "unknown")
+        etf_ok_count = us_result.get("successful_etf_count", 0)
+        failed_etfs = us_result.get("failed_etfs", [])
+
+        status_color = {"ok": "🟢", "partial_failed": "🔴", "no_data": "⚫"}.get(us_status, "⚪")
+        st.markdown(f"**ETF 수집 상태:** {status_color} `{us_status}`")
+        total_etf = etf_ok_count + len(failed_etfs)
+        st.markdown(f"**성공 ETF 수:** {etf_ok_count} / {total_etf if total_etf else '?'}")
+
+        if us_status == "partial_failed":
+            st.warning("⚠️ 섹터 ETF 5개 미만 성공 → strong_sectors=[] 적용 (US 가점 없음)")
+
+        if failed_etfs:
+            st.markdown(f"**실패 ETF ({len(failed_etfs)}개):** {', '.join(failed_etfs[:15])}")
+        else:
+            st.caption("실패 ETF: 없음")
+
+        unknown_count = sum(1 for s in excluded if s.get("excluded_reason") == "unknown_sector")
+        if unknown_count:
+            st.markdown(f"**unknown 섹터 제외:** {unknown_count}개 (하드 제외)")
+
+        neg_cr = sum(1 for s in excluded if s.get("excluded_reason") == "negative_change_rate")
+        low_cr = sum(1 for s in excluded if s.get("excluded_reason") == "change_rate_below_min")
+        high_cr = sum(1 for s in excluded if s.get("excluded_reason") == "change_rate_above_max")
+        if neg_cr or low_cr or high_cr:
+            st.markdown(f"**상승률 필터:** 음수={neg_cr}개, 2%미만={low_cr}개, 15%초과={high_cr}개")

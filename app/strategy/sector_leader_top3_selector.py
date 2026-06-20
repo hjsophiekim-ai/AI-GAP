@@ -44,13 +44,8 @@ _HARD_MIN_TV = 2_000_000_000     # 20억
 _HARD_MIN_CR = 2.0
 _HARD_MAX_CR = 15.0
 
-# Fallback relaxed thresholds (type 2 fallback)
-_FALLBACK_MIN_PRICE = 10_000
-_FALLBACK_MIN_CR = 1.0
-
-
 def _is_hard_excluded(stock: dict) -> tuple[bool, str]:
-    """하드 제외 여부와 사유를 반환한다."""
+    """하드 제외 여부와 사유를 반환한다. fallback에서도 절대 복구 불가."""
     if stock.get("is_etf") or stock.get("is_etn"):
         return True, "etf_etn"
     if stock.get("is_preferred"):
@@ -61,6 +56,8 @@ def _is_hard_excluded(stock: dict) -> tuple[bool, str]:
         return True, "reit"
     if stock.get("is_suspended") or stock.get("is_halt"):
         return True, "suspended"
+    if stock.get("sector") == "unknown":
+        return True, "unknown_sector"
     price = stock.get("current_price", 0)
     if price < _HARD_MIN_PRICE:
         return True, f"price_below_{_HARD_MIN_PRICE}"
@@ -69,18 +66,12 @@ def _is_hard_excluded(stock: dict) -> tuple[bool, str]:
         return True, "trading_value_below_20b"
     cr = stock.get("change_rate", 0.0)
     if cr > _HARD_MAX_CR:
-        return True, f"change_rate_above_{_HARD_MAX_CR}"
+        return True, "change_rate_above_max"
+    if cr <= 0:
+        return True, "negative_change_rate"
     if cr < _HARD_MIN_CR:
-        return True, f"change_rate_below_{_HARD_MIN_CR}"
+        return True, "change_rate_below_min"
     return False, ""
-
-
-def _is_type_excluded(stock: dict) -> bool:
-    return bool(
-        stock.get("is_etf") or stock.get("is_etn")
-        or stock.get("is_preferred") or stock.get("is_spac")
-        or stock.get("is_reit") or stock.get("is_suspended") or stock.get("is_halt")
-    )
 
 
 class SectorLeaderTop3Selector:
@@ -139,6 +130,7 @@ class SectorLeaderTop3Selector:
             "total_nxt": len(nxt_stocks),
             "hard_excluded": 0,
             "after_hard_filter": 0,
+            "candidates_evaluated": 0,
             "sectors_found": 0,
             "top3_count": 0,
             "fallback_used": False,
@@ -160,6 +152,13 @@ class SectorLeaderTop3Selector:
             else:
                 passed.append(s)
         diag["after_hard_filter"] = len(passed)
+        diag["candidates_evaluated"] = len(passed)
+
+        # eligible=0 → 즉시 반환 (fallback도 hard-excluded 복구 불가)
+        if len(passed) == 0:
+            logger.warning("[SectorLeaderTop3] 하드 필터 통과 종목 0개 → Top3 불가")
+            diag["top3_count"] = 0
+            return [], diag, excluded
 
         # ── Stage 3: 섹터 강도 계산 ──────────────────────────────────────
         sector_analysis = self._analyze_sectors(passed, vs_symbols)
@@ -179,10 +178,10 @@ class SectorLeaderTop3Selector:
         # ── Stage 5: Top3 선정 (동일 섹터 최대 2개) ──────────────────────
         top3 = self._pick_top3(scored)
 
-        # ── Stage 6: Fallback ────────────────────────────────────────────
+        # ── Stage 6: Fallback (passed 목록 내에서만, hard 조건 복구 없음) ─
         if len(top3) < 3:
             diag["fallback_used"] = True
-            top3 = self._fallback(top3, nxt_stocks, vs_symbols, us_sector_result, sector_analysis)
+            top3 = self._fallback(top3, passed, vs_symbols, us_sector_result, sector_analysis)
 
         # ── Stage 7: rank 부여 및 메타데이터 ─────────────────────────────
         for i, s in enumerate(top3, 1):
@@ -192,6 +191,11 @@ class SectorLeaderTop3Selector:
 
         diag["top3_count"] = len(top3)
         self._last_excluded = excluded
+
+        assert all("symbol" in s for s in top3), "top3 항목에 symbol 누락"
+        assert all("final_score" in s for s in top3), "top3 항목에 final_score 누락"
+        assert len(top3) <= 3, f"top3 개수 초과: {len(top3)}"
+
         logger.info(
             "[SectorLeaderTop3] 수집 %d → 하드제외 %d → 통과 %d → Top3 %d",
             diag["total_nxt"], diag["hard_excluded"], diag["after_hard_filter"], diag["top3_count"],
@@ -400,75 +404,47 @@ class SectorLeaderTop3Selector:
     def _fallback(
         self,
         current_top3: list[dict],
-        original_stocks: list[dict],
+        passed: list[dict],
         vs_symbols: set,
         us_sector_result: dict,
         sector_analysis: dict,
     ) -> list[dict]:
-        """Top3 미달 시 조건을 완화하여 추가 선정한다."""
-        needed = 3 - len(current_top3)
+        """Top3 미달 시 passed(하드 필터 통과) 내에서만 추가 선정.
+
+        hard_excluded/unknown/change_rate 위반 종목은 절대 복구하지 않는다.
+        소프트 조건(동일 섹터 제한)만 완화.
+        """
+        if len(current_top3) >= 3:
+            return current_top3
+
         selected_symbols = {s["symbol"] for s in current_top3}
-
-        # Fallback 1: change_rate 1%+, price 20000+, TV 20억+
-        fallback_pool: list[dict] = []
-        for s in original_stocks:
-            sym = s.get("symbol", "")
-            if sym in selected_symbols:
-                continue
-            if _is_type_excluded(s):
-                continue
-            price = s.get("current_price", 0)
-            tv = s.get("trading_value", s.get("trade_value", 0))
-            cr = s.get("change_rate", 0.0)
-            if price < _HARD_MIN_PRICE or tv < _HARD_MIN_TV or cr > _HARD_MAX_CR:
-                continue
-            if cr >= _FALLBACK_MIN_CR:
-                scored = self._score_stock(s, sector_analysis, vs_symbols, us_sector_result)
-                fallback_pool.append(scored)
-
-        fallback_pool.sort(key=lambda x: x["final_score"], reverse=True)
-
-        sector_count: dict[str, int] = {s.get("sector", "unknown"): 0 for s in current_top3}
+        sector_count: dict[str, int] = {}
         for s in current_top3:
             sec = s.get("sector", "unknown")
             sector_count[sec] = sector_count.get(sec, 0) + 1
 
-        for s in fallback_pool:
+        # Score remaining passed stocks (not yet selected)
+        remaining: list[dict] = []
+        for s in passed:
+            sym = s.get("symbol", "")
+            if sym in selected_symbols:
+                continue
+            scored = self._score_stock(s, sector_analysis, vs_symbols, us_sector_result)
+            remaining.append(scored)
+
+        remaining.sort(key=lambda x: x["final_score"], reverse=True)
+
+        # Pick with same-sector max-2 constraint still enforced
+        for s in remaining:
             if len(current_top3) >= 3:
                 break
             sec = s.get("sector", "unknown")
             if sector_count.get(sec, 0) >= 2:
                 continue
-            s["selected_reason"] = (s.get("selected_reason", "") + "|fallback1").lstrip("|")
+            s["selected_reason"] = (s.get("selected_reason", "") + "|fallback").lstrip("|")
             current_top3.append(s)
             sector_count[sec] = sector_count.get(sec, 0) + 1
             selected_symbols.add(s["symbol"])
-
-        # Fallback 2: relax price to 10000
-        if len(current_top3) < 3:
-            for s in original_stocks:
-                if len(current_top3) >= 3:
-                    break
-                sym = s.get("symbol", "")
-                if sym in selected_symbols:
-                    continue
-                if _is_type_excluded(s):
-                    continue
-                price = s.get("current_price", 0)
-                tv = s.get("trading_value", s.get("trade_value", 0))
-                cr = s.get("change_rate", 0.0)
-                if price < _FALLBACK_MIN_PRICE or tv < _HARD_MIN_TV:
-                    continue
-                if cr > _HARD_MAX_CR or cr < _FALLBACK_MIN_CR:
-                    continue
-                sec = s.get("sector", "unknown")
-                if sector_count.get(sec, 0) >= 2:
-                    continue
-                scored = self._score_stock(s, sector_analysis, vs_symbols, us_sector_result)
-                scored["selected_reason"] = (scored.get("selected_reason", "") + "|fallback2").lstrip("|")
-                current_top3.append(scored)
-                sector_count[sec] = sector_count.get(sec, 0) + 1
-                selected_symbols.add(sym)
 
         return current_top3
 
@@ -489,7 +465,9 @@ class SectorLeaderTop3Selector:
             "current_price", "change_rate", "trading_value",
             "sector_strength_score", "sector_leader_score", "us_sector_match_score",
             "volume_spike_confirm_score", "ma_bonus", "risk_penalty", "final_score",
-            "selected_reason", "matched_us_sector", "us_sector_reason",
+            "hard_excluded", "eligible", "selected", "selected_reason",
+            "sector_rank", "warning_reason", "excluded_reason",
+            "matched_us_sector", "us_sector_reason",
             "us_data_source", "market_regime",
         ]
         rows = [{col: s.get(col, "") for col in columns} for s in top3]

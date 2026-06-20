@@ -230,6 +230,7 @@ class SectorStrengthAnalyzer:
 
         # ── 4. 결과 저장 ─────────────────────────────────────────────────────
         self._sector_data = {s["sector"]: s for s in sector_summaries}
+        self._sector_data.pop("unknown", None)  # unknown 섹터는 Top 순위에서 제외
 
         logger.info(
             "[SectorStrengthAnalyzer] 분석 완료: %d섹터, top=%s(score=%s)",

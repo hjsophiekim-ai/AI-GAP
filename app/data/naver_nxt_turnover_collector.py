@@ -31,7 +31,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 # ── URL 설정 ──────────────────────────────────────────────────────────────────
-_NXT_URL = "https://finance.naver.com/sise/sise_quant.naver"
+_NXT_URL = "https://finance.naver.com/sise/nxt_sise_quant.naver"
 _FALLBACK_URL = "https://finance.naver.com/sise/sise_quant_high.naver"
 _TIMEOUT = 8
 
@@ -270,6 +270,10 @@ class NaverNxtTurnoverCollector:
         self._fallback_url = fallback_url
         self._used_fallback = False
         self._session = _get_session()
+
+    @property
+    def primary_url(self) -> str:
+        return self._primary_url
 
     @property
     def used_fallback(self) -> bool:

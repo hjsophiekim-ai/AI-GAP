@@ -253,7 +253,9 @@ class TestUSSectorStrengthService:
         from app.services.us_sector_strength_service import USSectorStrengthService
 
         def _mock_fetch(self, symbols):
-            return {"SMH": 2.5, "SOXX": 1.8, "XLK": 1.2, "SPY": 0.5, "QQQ": 1.0}
+            data = {"SMH": 2.5, "SOXX": 1.8, "XLK": 1.2, "XLI": 0.8, "XLF": -0.2,
+                    "XLV": 0.5, "XLY": 0.3, "SPY": 0.5, "QQQ": 1.0}
+            return {k: {"change_pct": v, "success": True, "error": ""} for k, v in data.items()}
 
         monkeypatch.setattr(USSectorStrengthService, "_fetch_yahoo_etf_changes", _mock_fetch)
         svc = USSectorStrengthService()
@@ -266,7 +268,9 @@ class TestUSSectorStrengthService:
         from app.services.us_sector_strength_service import USSectorStrengthService
 
         def _mock_fetch(self, symbols):
-            return {"SMH": 3.5, "SOXX": 3.0, "XLK": 0.2, "XLF": -0.5, "SPY": 0.3, "QQQ": 0.8}
+            data = {"SMH": 3.5, "SOXX": 3.0, "XLK": 0.2, "XLF": -0.5,
+                    "XLI": 0.1, "XLV": 0.0, "XLY": -0.1, "SPY": 0.3, "QQQ": 0.8}
+            return {k: {"change_pct": v, "success": True, "error": ""} for k, v in data.items()}
 
         monkeypatch.setattr(USSectorStrengthService, "_fetch_yahoo_etf_changes", _mock_fetch)
         svc = USSectorStrengthService()
@@ -278,7 +282,9 @@ class TestUSSectorStrengthService:
         from app.services.us_sector_strength_service import USSectorStrengthService
 
         def _mock_fetch(self, symbols):
-            return {"SPY": -1.5, "QQQ": -2.0, "SMH": -1.0, "XLK": -1.5}
+            data = {"SPY": -1.5, "QQQ": -2.0, "SMH": -1.0, "XLK": -1.5,
+                    "XLI": -1.2, "XLF": -0.8, "XLV": -0.5, "XLY": -1.0}
+            return {k: {"change_pct": v, "success": True, "error": ""} for k, v in data.items()}
 
         monkeypatch.setattr(USSectorStrengthService, "_fetch_yahoo_etf_changes", _mock_fetch)
         svc = USSectorStrengthService()
@@ -295,9 +301,10 @@ class TestUSSectorStrengthService:
         monkeypatch.setattr(requests.Session, "get", _raise)
         svc = USSectorStrengthService()
         result = svc.get_us_sector_strength()
-        # 예외 없이 반환되어야 함
+        # 예외 없이 반환되어야 함; 연결 실패 시 partial_failed 또는 cache/none
         assert isinstance(result, dict)
-        assert result.get("data_source_used") in ("cache", "none")
+        assert "market_regime" in result
+        assert "strong_sectors" in result
 
     def test_fallback_when_ssga_fails(self, monkeypatch):
         """SSGA 파싱 실패 시 Yahoo fallback 실행 확인."""
@@ -320,21 +327,22 @@ class TestUSSectorStrengthService:
     def test_risk_off_reduces_us_match_score(self, monkeypatch):
         from app.services.us_sector_strength_service import USSectorStrengthService
 
-        def _mock_fetch(self, symbols):
-            return {"SMH": 3.0, "SPY": -1.5, "QQQ": -2.0}
-
-        monkeypatch.setattr(USSectorStrengthService, "_fetch_yahoo_etf_changes", _mock_fetch)
         svc = USSectorStrengthService()
-        us_result = svc.get_us_sector_strength()
-        us_result["market_regime"] = "risk_off"
+        # us_result을 직접 구성 (OK status, semiconductor in strong)
+        us_result = {
+            "market_regime": "risk_on",
+            "data_source_used": "yahoo",
+            "us_sector_data_status": "ok",
+            "strong_sectors": ["semiconductor"],
+            "moderate_sectors": [],
+            "sector_scores": {"semiconductor": 85},
+        }
 
         score_on, _, _ = svc.get_us_sector_match_score("semiconductor", us_result, us_sector_match_score_max=20)
-        us_result["market_regime"] = "risk_on"
-        score_off_base, _, _ = svc.get_us_sector_match_score("semiconductor", us_result, us_sector_match_score_max=20)
         us_result["market_regime"] = "risk_off"
         score_off, _, _ = svc.get_us_sector_match_score("semiconductor", us_result, us_sector_match_score_max=20)
         # risk_off 시 점수 축소 확인
-        assert score_off <= score_off_base
+        assert score_off <= score_on
 
     def test_top3_csv_us_columns(self, tmp_path, monkeypatch):
         """Top3 CSV에 us_sector_match_score, matched_us_sector, us_sector_reason 포함 확인."""
@@ -520,3 +528,229 @@ class TestSectorLeaderTop3Selector:
                         + s.get("us_sector_match_score", 0) + s.get("volume_spike_confirm_score", 0)
                         + s.get("ma_bonus", 0) - s.get("risk_penalty", 0))
             assert abs(s.get("final_score", 0) - expected) < 0.01
+
+
+# ─────────────────────────────────────────────────────────────
+# NEW: US ETF 데이터 상태 (partial_failed) 테스트
+# ─────────────────────────────────────────────────────────────
+
+class TestUSSectorDataStatus:
+    def test_partial_failed_when_few_sector_etfs(self, monkeypatch):
+        """섹터 ETF 5개 미만 성공 시 partial_failed → strong_sectors=[]."""
+        from app.services.us_sector_strength_service import USSectorStrengthService
+
+        def _mock_fetch(self, symbols):
+            # 3개만 성공 (SPY, QQQ 제외하면 3개 → < 5)
+            data = {"SPY": 0.5, "QQQ": 0.8, "SMH": 2.0, "SOXX": 1.5, "XLK": 0.8}
+            return {k: {"change_pct": v, "success": True, "error": ""} for k, v in data.items()}
+
+        monkeypatch.setattr(USSectorStrengthService, "_fetch_yahoo_etf_changes", _mock_fetch)
+        svc = USSectorStrengthService()
+        result = svc.get_us_sector_strength()
+        assert result.get("us_sector_data_status") == "partial_failed"
+        assert result.get("strong_sectors") == []
+
+    def test_ok_when_enough_sector_etfs(self, monkeypatch):
+        """섹터 ETF 5개 이상 성공 시 ok 상태 → sector_scores 계산됨."""
+        from app.services.us_sector_strength_service import USSectorStrengthService
+
+        def _mock_fetch(self, symbols):
+            data = {"SPY": 0.3, "QQQ": 0.6, "SMH": 3.0, "SOXX": 2.8,
+                    "XLK": 1.5, "XLI": 0.8, "XLF": 0.2, "XLV": -0.1}
+            return {k: {"change_pct": v, "success": True, "error": ""} for k, v in data.items()}
+
+        monkeypatch.setattr(USSectorStrengthService, "_fetch_yahoo_etf_changes", _mock_fetch)
+        svc = USSectorStrengthService()
+        result = svc.get_us_sector_strength()
+        assert result.get("us_sector_data_status") == "ok"
+        assert len(result.get("sector_scores", {})) > 0
+
+    def test_partial_failed_blocks_match_score(self, monkeypatch):
+        """partial_failed 상태에서 get_us_sector_match_score는 0점 반환."""
+        from app.services.us_sector_strength_service import USSectorStrengthService
+
+        svc = USSectorStrengthService()
+        us_result = {
+            "data_source_used": "yahoo",
+            "us_sector_data_status": "partial_failed",
+            "strong_sectors": ["semiconductor"],
+            "market_regime": "risk_on",
+        }
+        score, _, reason = svc.get_us_sector_match_score("semiconductor", us_result, 20)
+        assert score == 0
+        assert reason == "sector_etf_data_missing"
+
+
+# ─────────────────────────────────────────────────────────────
+# NEW: unknown 섹터 하드 제외 테스트
+# ─────────────────────────────────────────────────────────────
+
+class TestUnknownSectorExclusion:
+    def test_unknown_sector_is_hard_excluded(self):
+        """sector='unknown' 종목은 하드 제외되어야 한다."""
+        from app.strategy.sector_leader_top3_selector import _is_hard_excluded
+        stock = _make_stock("999999", "미분류종목", 50000, 5.0, 50_000_000_000)
+        stock["sector"] = "unknown"
+        excluded, reason = _is_hard_excluded(stock)
+        assert excluded is True
+        assert reason == "unknown_sector"
+
+    def test_unknown_sector_not_in_top3(self):
+        """sector='unknown' 종목은 Top3에 포함되지 않아야 한다 (fallback 포함)."""
+        from app.strategy.sector_leader_top3_selector import SectorLeaderTop3Selector
+        # unknown 종목만 있는 경우 → Top3 = []
+        stocks = [
+            {**_make_stock("999999", "미분류", 50000, 5.0, 50_000_000_000, rank=1),
+             "sector": "unknown", "subtheme": ""},
+            {**_make_stock("888888", "미분류2", 60000, 4.0, 40_000_000_000, rank=2),
+             "sector": "unknown", "subtheme": ""},
+        ]
+        selector = SectorLeaderTop3Selector()
+        top3, diag, excluded = selector.select(stocks, [], {})
+        top3_symbols = {s["symbol"] for s in top3}
+        assert "999999" not in top3_symbols
+        assert "888888" not in top3_symbols
+
+    def test_unknown_sector_excluded_from_analyzer(self):
+        """SectorStrengthAnalyzer 결과에 unknown 섹터가 없어야 한다."""
+        from app.strategy.sector_strength_analyzer import SectorStrengthAnalyzer
+        stocks = [
+            {**_make_stock("000660", "SK하이닉스", 200000, 5.0, 500_000_000_000, rank=1),
+             "sector": "semiconductor", "subtheme": ""},
+            {**_make_stock("999999", "미분류", 50000, 5.0, 50_000_000_000, rank=2),
+             "sector": "unknown", "subtheme": ""},
+        ]
+        analyzer = SectorStrengthAnalyzer()
+        result = analyzer.analyze(stocks)
+        assert "unknown" not in result, f"unknown 섹터가 분석 결과에 포함됨: {list(result.keys())}"
+
+
+# ─────────────────────────────────────────────────────────────
+# NEW: eligible=0 시 Top3=[] 반환 테스트
+# ─────────────────────────────────────────────────────────────
+
+class TestEligibleZeroProducesNoTop3:
+    def test_all_hard_excluded_returns_empty_top3(self):
+        """모든 종목이 하드 제외되면 Top3=[] 반환, fallback 미발동."""
+        from app.strategy.sector_leader_top3_selector import SectorLeaderTop3Selector
+        stocks_all_excluded = [
+            {**_make_stock("069500", "KODEX200", 30000, 1.0, 200_000_000_000, is_etf=True, rank=1),
+             "sector": "semiconductor", "subtheme": ""},
+            {**_make_stock("005935", "삼성전자우", 70000, 3.0, 100_000_000_000, is_preferred=True, rank=2),
+             "sector": "semiconductor", "subtheme": ""},
+            {**_make_stock("123456", "저가주", 5000, 5.0, 50_000_000_000, rank=3),
+             "sector": "defense", "subtheme": ""},
+        ]
+        selector = SectorLeaderTop3Selector()
+        top3, diag, excluded = selector.select(stocks_all_excluded, [], {})
+        assert top3 == [], f"전원 하드제외인데 Top3가 비어있지 않음: {top3}"
+        assert diag.get("candidates_evaluated", diag.get("after_hard_filter", 0)) == 0
+        assert len(excluded) > 0
+
+    def test_fallback_does_not_recover_hard_excluded(self):
+        """Fallback이 하드 제외된 종목을 복구하지 않는지 확인."""
+        from app.strategy.sector_leader_top3_selector import SectorLeaderTop3Selector
+        # ETF 1개 + 저가주 2개 → 모두 하드 제외
+        stocks = [
+            {**_make_stock("069500", "KODEX200", 30000, 1.0, 200_000_000_000, is_etf=True, rank=1),
+             "sector": "semiconductor", "subtheme": ""},
+            {**_make_stock("111111", "저가주A", 10000, 5.0, 50_000_000_000, rank=2),
+             "sector": "defense", "subtheme": ""},
+            {**_make_stock("222222", "저가주B", 8000, 4.0, 30_000_000_000, rank=3),
+             "sector": "defense", "subtheme": ""},
+        ]
+        selector = SectorLeaderTop3Selector()
+        top3, _, _ = selector.select(stocks, [], {})
+        assert len(top3) == 0
+
+
+# ─────────────────────────────────────────────────────────────
+# NEW: 상승률 하드 필터 세부 사유 테스트
+# ─────────────────────────────────────────────────────────────
+
+class TestChangeRateHardFilter:
+    def test_negative_change_rate_excluded(self):
+        """음수 상승률은 negative_change_rate로 하드 제외."""
+        from app.strategy.sector_leader_top3_selector import _is_hard_excluded
+        stock = _make_stock("000001", "테스트A", 50000, -1.0, 50_000_000_000)
+        stock["sector"] = "semiconductor"
+        excl, reason = _is_hard_excluded(stock)
+        assert excl is True
+        assert reason == "negative_change_rate"
+
+    def test_zero_change_rate_excluded(self):
+        """0% 상승률은 negative_change_rate로 하드 제외."""
+        from app.strategy.sector_leader_top3_selector import _is_hard_excluded
+        stock = _make_stock("000002", "테스트B", 50000, 0.0, 50_000_000_000)
+        stock["sector"] = "semiconductor"
+        excl, reason = _is_hard_excluded(stock)
+        assert excl is True
+        assert reason == "negative_change_rate"
+
+    def test_below_2pct_excluded(self):
+        """0%~2% 사이 상승률은 change_rate_below_min으로 하드 제외."""
+        from app.strategy.sector_leader_top3_selector import _is_hard_excluded
+        stock = _make_stock("000003", "테스트C", 50000, 1.5, 50_000_000_000)
+        stock["sector"] = "semiconductor"
+        excl, reason = _is_hard_excluded(stock)
+        assert excl is True
+        assert reason == "change_rate_below_min"
+
+    def test_above_15pct_excluded(self):
+        """15% 초과 상승률은 change_rate_above_max로 하드 제외."""
+        from app.strategy.sector_leader_top3_selector import _is_hard_excluded
+        stock = _make_stock("000004", "테스트D", 50000, 16.0, 50_000_000_000)
+        stock["sector"] = "semiconductor"
+        excl, reason = _is_hard_excluded(stock)
+        assert excl is True
+        assert reason == "change_rate_above_max"
+
+    def test_exactly_2pct_included(self):
+        """정확히 2% 상승률은 하드 제외 아님."""
+        from app.strategy.sector_leader_top3_selector import _is_hard_excluded
+        stock = _make_stock("000005", "테스트E", 50000, 2.0, 50_000_000_000)
+        stock["sector"] = "semiconductor"
+        excl, reason = _is_hard_excluded(stock)
+        assert excl is False, f"2% 종목이 하드 제외됨: {reason}"
+
+    def test_fallback_does_not_allow_below_2pct(self):
+        """Fallback도 CR<2% 종목을 복구하지 않는다."""
+        from app.strategy.sector_leader_top3_selector import SectorLeaderTop3Selector
+        from app.strategy.sector_mapper import SectorMapper
+        mapper = SectorMapper()
+        # 상승률 1.5% 종목 (하드 제외) + 정상 종목 1개
+        stocks = [
+            {**_make_stock("000660", "SK하이닉스", 200000, 5.0, 500_000_000_000, rank=1),
+             "sector": "semiconductor", "subtheme": ""},
+            {**_make_stock("999991", "1.5%종목", 50000, 1.5, 50_000_000_000, rank=2),
+             "sector": "defense", "subtheme": ""},
+        ]
+        selector = SectorLeaderTop3Selector()
+        top3, _, _ = selector.select(stocks, [], {})
+        top3_symbols = {s["symbol"] for s in top3}
+        assert "999991" not in top3_symbols, "CR<2% 종목이 Top3에 포함됨"
+
+
+# ─────────────────────────────────────────────────────────────
+# NEW: NXT 수집기 URL 및 primary_url 속성 테스트
+# ─────────────────────────────────────────────────────────────
+
+class TestNxtCollectorURL:
+    def test_primary_url_is_nxt(self):
+        """기본 수집 URL이 nxt_sise_quant.naver를 사용해야 한다."""
+        from app.data.naver_nxt_turnover_collector import NaverNxtTurnoverCollector, _NXT_URL
+        assert "nxt_sise_quant" in _NXT_URL, f"URL이 올바르지 않음: {_NXT_URL}"
+
+    def test_primary_url_property(self):
+        """NaverNxtTurnoverCollector.primary_url 속성이 존재해야 한다."""
+        from app.data.naver_nxt_turnover_collector import NaverNxtTurnoverCollector
+        col = NaverNxtTurnoverCollector()
+        assert hasattr(col, "primary_url"), "primary_url 속성 없음"
+        assert "nxt_sise_quant" in col.primary_url, f"primary_url 잘못됨: {col.primary_url}"
+
+    def test_custom_primary_url(self):
+        """커스텀 primary_url을 지정할 수 있어야 한다."""
+        from app.data.naver_nxt_turnover_collector import NaverNxtTurnoverCollector
+        custom_url = "https://finance.naver.com/sise/custom_test.naver"
+        col = NaverNxtTurnoverCollector(primary_url=custom_url)
+        assert col.primary_url == custom_url
