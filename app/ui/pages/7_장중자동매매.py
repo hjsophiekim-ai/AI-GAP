@@ -32,6 +32,21 @@ except Exception as e:
 cfg = get_config()
 _today = datetime.now().strftime("%Y%m%d")
 
+
+def _safe_create_broker(mode, confirm_text="", runtime_real_mode=False,
+                         runtime_enable_real_buy=False, runtime_enable_real_sell=False):
+    try:
+        return create_broker(cfg=cfg, mode=mode, confirm_text=confirm_text,
+                             runtime_real_mode=runtime_real_mode,
+                             runtime_enable_real_buy=runtime_enable_real_buy,
+                             runtime_enable_real_sell=runtime_enable_real_sell)
+    except TypeError:
+        try:
+            return create_broker(cfg=cfg, mode=mode, confirm_text=confirm_text,
+                                 runtime_real_mode=runtime_real_mode)
+        except TypeError:
+            return create_broker(cfg=cfg, mode=mode)
+
 # ── 상태 이모지 매핑 ──────────────────────────────────────────────────────────
 _STATUS_EMOJI = {
     STATUS_WAITING:  "⏳ 대기",
@@ -104,23 +119,86 @@ def _load_trade_log() -> list[dict]:
 st.title("완전 자동 장중매매 — 주도섹터 Top3")
 st.caption("1분봉/3분봉 기반 자동매수·매도·재진입 | 상태머신 관리")
 
-runtime_real = st.session_state.get("runtime_real_mode", False)
-if runtime_real:
-    st.error("⚠️ 실전모드 ON — 실제 주문이 발생할 수 있습니다.")
-
 st.divider()
 
-# ── 예산 / 모드 ──────────────────────────────────────────────────────────────
-col_budget, col_mode = st.columns([3, 1])
+# ── 계좌 모드 / 예산 ──────────────────────────────────────────────────────────
+col_mode, col_budget = st.columns([1, 2])
+with col_mode:
+    selected_mode = st.selectbox(
+        "계좌 모드",
+        options=["dry_run", "mock", "real"],
+        index=["dry_run", "mock", "real"].index(cfg.mode) if cfg.mode in ["dry_run", "mock", "real"] else 0,
+        help="dry_run: 가상 | mock: KIS 모의투자 | real: KIS 실전투자",
+    )
 with col_budget:
     total_budget = st.number_input(
         "총 예산 (원)", min_value=1_000_000, max_value=100_000_000,
         value=int(cfg.trading.get("total_budget", 10_000_000)),
         step=1_000_000, format="%d",
     )
-with col_mode:
-    st.markdown("**현재 모드**")
-    st.markdown(f"`{cfg.mode.upper()}`")
+
+# 모드별 안내
+if selected_mode == "dry_run":
+    st.info("드라이런 모드: 실제 주문 없이 가상 매수/매도가 실행됩니다.")
+elif selected_mode == "mock":
+    st.warning("모의투자 모드: KIS 모의투자 계좌에 주문됩니다. (실제 돈 아님)")
+elif selected_mode == "real":
+    st.error("실전투자 모드: 실제 KIS 계좌에 주문됩니다. 신중하게 확인하세요!")
+
+# 실전 런타임 플래그
+_runtime_real_mode = False
+_runtime_enable_real_buy = st.session_state.get("enable_real_buy", False)
+_runtime_enable_real_sell = st.session_state.get("enable_real_sell", False)
+
+if selected_mode == "real":
+    _real_mode_enabled = st.session_state.get("real_mode_enabled", False)
+    if _real_mode_enabled:
+        st.error("실전모드 활성화 중 — 실제 계좌로 자동매매가 실행됩니다.", icon="🔴")
+        _runtime_real_mode = True
+    else:
+        st.error("실전모드 미활성화 — 'API 연결' 페이지에서 실전모드 버튼을 먼저 활성화하세요.")
+
+# 실전 확인 문구
+_confirm_text = ""
+if selected_mode == "real":
+    try:
+        _expected_text = cfg.real_confirm_text()
+    except Exception:
+        _expected_text = "I_UNDERSTAND_REAL_TRADING_RISK"
+    _confirm_text = st.text_input(
+        f"실전투자 확인 문구 입력 ('{_expected_text}')",
+        type="password", placeholder=_expected_text,
+    )
+    if _confirm_text and _confirm_text != _expected_text:
+        st.error("확인 문구가 틀립니다. 자동매매 버튼이 비활성화됩니다.")
+
+_real_confirm_ok = (
+    selected_mode != "real"
+    or (_confirm_text and _confirm_text == (
+        cfg.real_confirm_text() if callable(getattr(cfg, "real_confirm_text", None))
+        else "I_UNDERSTAND_REAL_TRADING_RISK"
+    ))
+)
+
+# 토큰 캐시 상태 (real/mock)
+if selected_mode in ("mock", "real"):
+    with st.expander("브로커 연결 상태", expanded=False):
+        import json as _json
+        _cache_path = _SVC_ROOT / "data" / "cache" / f"kis_token_{selected_mode}.json"
+        if _cache_path.exists():
+            try:
+                with open(_cache_path) as _f:
+                    _cd = _json.load(_f)
+                _exp = _cd.get("expires_at", "")
+                st.caption(f"KIS {selected_mode.upper()} 토큰: 만료 {_exp[:19] if _exp else '알 수 없음'}")
+            except Exception:
+                st.caption("토큰 캐시 읽기 실패")
+        else:
+            st.caption(f"KIS {selected_mode.upper()} 토큰: 없음 (첫 실행 시 발급)")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("선택 모드", selected_mode.upper())
+        c2.metric("실전매수", "허용" if _runtime_enable_real_buy else "차단")
+        c3.metric("실전매도", "허용" if _runtime_enable_real_sell else "차단")
 
 st.divider()
 
@@ -158,11 +236,13 @@ running = st.session_state.get("intraday_auto_trade_running", False)
 
 col_on, col_off, col_once, col_refresh = st.columns(4)
 with col_on:
-    if st.button("▶ 자동매매 ON", type="primary", use_container_width=True, disabled=running):
+    _btn_disabled = running or (selected_mode == "real" and not _real_confirm_ok)
+    if st.button("▶ 자동매매 ON", type="primary", use_container_width=True, disabled=_btn_disabled):
         if not st.session_state.get("intraday_allocated_top3"):
             st.error("먼저 Top3 종목을 불러오세요.")
         else:
             st.session_state["intraday_auto_trade_running"] = True
+            st.session_state["intraday_selected_mode"] = selected_mode
             st.rerun()
 with col_off:
     if st.button("⏹ 자동매매 OFF", use_container_width=True, disabled=not running):
@@ -188,13 +268,16 @@ if running or manual_run:
     else:
         try:
             with st.spinner("실행 중..."):
-                broker = create_broker(
-                    cfg=cfg, mode=cfg.mode,
-                    runtime_real_mode=runtime_real,
-                    runtime_enable_real_buy=st.session_state.get("runtime_enable_real_buy", False),
-                    runtime_enable_real_sell=st.session_state.get("runtime_enable_real_sell", False),
+                _active_mode = st.session_state.get("intraday_selected_mode", selected_mode)
+                broker = _safe_create_broker(
+                    mode=_active_mode,
+                    confirm_text=_confirm_text,
+                    runtime_real_mode=_runtime_real_mode,
+                    runtime_enable_real_buy=_runtime_enable_real_buy,
+                    runtime_enable_real_sell=_runtime_enable_real_sell,
                 )
-                svc = IntradayAutoTradeService(broker=broker, kis_client=None, cfg=cfg)
+                kis_client = getattr(broker, "_kis", None) or getattr(broker, "kis_client", None)
+                svc = IntradayAutoTradeService(broker=broker, kis_client=kis_client, cfg=cfg)
                 svc.total_budget = float(total_budget)
                 svc.load_top3(allocated)
                 result = svc.run_once()
