@@ -11,8 +11,8 @@ import os
 import streamlit as st
 
 try:
-    from app.trading.kis_client import create_kis_client
-    from app.config import get_config
+    from app.trading.kis_client import create_kis_client, KISTokenError
+    from app.config import get_config, get_kis_account_config
 except Exception as e:
     st.error(f"모듈 로드 오류: {e}")
     st.stop()
@@ -30,20 +30,63 @@ def _run_test(mode: str, test_name: str) -> None:
 
     if test_name == "token":
         with st.spinner("토큰 발급 중..."):
+            # 환경변수 체크 (진단용)
+            env_info: dict = {}
+            base_url_used = ""
+            try:
+                acc_cfg = get_kis_account_config(mode)
+                env_info = acc_cfg.get("env_checks", {})
+                base_url_used = acc_cfg.get("base_url", "")
+            except Exception:
+                pass
+
             try:
                 client = create_kis_client(mode)
                 if client is None:
-                    st.error(f"{mode.upper()} KIS 클라이언트 생성 실패 — .env의 KIS_{mode.upper()}_* 환경변수를 확인하세요.")
+                    st.error(
+                        f"{mode.upper()} KIS 클라이언트 생성 실패 — "
+                        f".env의 KIS_{mode.upper()}_APP_KEY / KIS_{mode.upper()}_APP_SECRET "
+                        f"환경변수를 확인하세요."
+                    )
                     return
                 token = client.get_access_token()
-                if token:
-                    st.session_state[key_client] = client
-                    st.session_state[key_ok] = True
-                    st.success(f"토큰 발급 성공 (길이: {len(token)}자)")
-                else:
-                    st.error("토큰이 비어있습니다.")
+                st.session_state[key_client] = client
+                st.session_state[key_ok] = True
+                expires_str = client._token_expires_at.strftime("%H:%M:%S") if client._token_expires_at else "?"
+                st.success(
+                    f"토큰 발급 성공  |  길이: {len(token)}자  |  "
+                    f"base_url: `{client.base_url}`  |  만료: {expires_str}"
+                )
+            except KISTokenError as exc:
+                st.error(f"토큰 발급 실패 (KIS 오류)")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(f"**HTTP 상태코드:** `{exc.http_status}`")
+                    st.markdown(f"**rt_cd:** `{exc.rt_cd or '(없음)'}`")
+                    st.markdown(f"**msg_cd:** `{exc.msg_cd or '(없음)'}`")
+                    st.markdown(f"**msg1:** `{exc.msg1 or '(없음)'}`")
+                    st.markdown(f"**base_url:** `{exc.base_url_used or base_url_used}`")
+                with col2:
+                    if env_info:
+                        st.markdown("**환경변수 상태:**")
+                        for k, v in env_info.items():
+                            icon = "✅" if v else "❌"
+                            st.markdown(f"{icon} `{k}`")
+                st.info(
+                    "토큰 발급은 일반적으로 장중 여부와 무관하게 가능해야 합니다.  \n"
+                    "실패 시 대부분 app key/secret, base_url, 환경변수 또는 KIS 서버 응답 오류입니다."
+                )
             except Exception as exc:
                 st.error(f"토큰 발급 실패: {exc}")
+                if env_info:
+                    with st.expander("환경변수 상태"):
+                        for k, v in env_info.items():
+                            icon = "✅" if v else "❌"
+                            st.markdown(f"{icon} `{k}`")
+                st.info(
+                    "토큰 발급은 일반적으로 장중 여부와 무관하게 가능해야 합니다.  \n"
+                    "실패 시 대부분 app key/secret, base_url, 환경변수 또는 KIS 서버 응답 오류입니다."
+                )
 
     elif test_name == "balance":
         client = st.session_state.get(key_client)

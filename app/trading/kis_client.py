@@ -46,8 +46,23 @@ ORD_DVSN_MARKET = "01"
 
 
 class KISTokenError(Exception):
-    """KIS oauth2/tokenP 403 오류 — 이 예외가 발생하면 배치 전체를 중단해야 합니다."""
-    pass
+    """KIS oauth2/tokenP 오류 — 이 예외가 발생하면 배치 전체를 중단해야 합니다."""
+
+    def __init__(
+        self,
+        message: str,
+        http_status: int = 0,
+        rt_cd: str = "",
+        msg_cd: str = "",
+        msg1: str = "",
+        base_url_used: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.rt_cd = rt_cd
+        self.msg_cd = msg_cd
+        self.msg1 = msg1
+        self.base_url_used = base_url_used
 
 
 class KISClient:
@@ -167,7 +182,7 @@ class KISClient:
         """
         액세스 토큰 발급/갱신.
         1) 메모리 캐시 (5분 버퍼) → 2) 파일 캐시 → 3) tokenP API 호출.
-        403 응답 시 KISTokenError 발생 (배치 전체 중단 신호).
+        비-200 또는 access_token 누락 시 KISTokenError(속성 포함) 발생.
         """
         now = datetime.now()
         # 1. 메모리 캐시
@@ -185,27 +200,57 @@ class KISClient:
         }
         try:
             resp = self._session.post(url, json=body, timeout=10)
-            if resp.status_code == 403:
-                rt_cd = msg_cd = msg1 = ""
-                try:
-                    err_data = resp.json()
-                    rt_cd = err_data.get("rt_cd", "")
-                    msg_cd = err_data.get("msg_cd", "")
-                    msg1 = err_data.get("msg1", err_data.get("error_description", ""))
-                except Exception:
-                    pass
+            http_status = resp.status_code
+
+            # raise_for_status() 전에 KIS 응답 body 파싱 (403/500 원인 확인용)
+            try:
+                resp_data = resp.json()
+            except Exception:
+                resp_data = {}
+            rt_cd = resp_data.get("rt_cd", "")
+            msg_cd = resp_data.get("msg_cd", "")
+            msg1 = resp_data.get("msg1", resp_data.get("error_description", ""))
+
+            if http_status == 403:
                 key_exists = bool(self._app_key and self._app_secret)
                 cache_exists = self._token_cache_path().exists()
                 raise KISTokenError(
                     f"[KIS-{self.mode.upper()}] tokenP 403 오류 | "
                     f"mode={self.mode} base_url={self.base_url} "
                     f"key_exists={key_exists} cache_exists={cache_exists} | "
-                    f"rt_cd={rt_cd!r} msg_cd={msg_cd!r} msg1={msg1!r}"
+                    f"rt_cd={rt_cd!r} msg_cd={msg_cd!r} msg1={msg1!r}",
+                    http_status=403,
+                    rt_cd=rt_cd,
+                    msg_cd=msg_cd,
+                    msg1=msg1,
+                    base_url_used=self.base_url,
                 )
-            resp.raise_for_status()
-            data = resp.json()
-            self._token = data.get("access_token", "")
-            expires_in = int(data.get("expires_in", 86400))
+            if not resp.ok:
+                raise KISTokenError(
+                    f"[KIS-{self.mode.upper()}] tokenP HTTP {http_status} 오류 | "
+                    f"base_url={self.base_url} | "
+                    f"rt_cd={rt_cd!r} msg_cd={msg_cd!r} msg1={msg1!r}",
+                    http_status=http_status,
+                    rt_cd=rt_cd,
+                    msg_cd=msg_cd,
+                    msg1=msg1,
+                    base_url_used=self.base_url,
+                )
+
+            token = resp_data.get("access_token", "")
+            if not token:
+                raise KISTokenError(
+                    f"[KIS-{self.mode.upper()}] tokenP 200이나 access_token 없음 | "
+                    f"rt_cd={rt_cd!r} msg_cd={msg_cd!r} msg1={msg1!r}",
+                    http_status=http_status,
+                    rt_cd=rt_cd,
+                    msg_cd=msg_cd,
+                    msg1=msg1,
+                    base_url_used=self.base_url,
+                )
+
+            self._token = token
+            expires_in = int(resp_data.get("expires_in", 86400))
             self._token_expires_at = now + timedelta(seconds=expires_in)
             self._save_token_cache()
             logger.info(

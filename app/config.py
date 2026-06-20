@@ -248,19 +248,48 @@ class Config:
         )
 
 
+def _parse_account_no(raw: str, product_code: str = "") -> tuple[str, str]:
+    """계좌번호 원문을 (CANO 8자리, ACNT_PRDT_CD 2자리)로 파싱.
+
+    지원 포맷:
+    - "64282746-01"  → ("64282746", "01")
+    - "6428274601"   → ("64282746", "01")
+    - "64282746"     → ("64282746", "01")  (product_code 기본값 적용)
+    """
+    raw = raw.strip()
+    if "-" in raw:
+        parts = raw.split("-", 1)
+        cano = parts[0].strip()
+        pcode = parts[1].strip().zfill(2) if len(parts) > 1 else product_code
+        return cano, pcode or product_code or "01"
+    if len(raw) == 10 and raw.isdigit():
+        return raw[:8], product_code or raw[8:] or "01"
+    return raw, product_code or "01"
+
+
 def get_kis_account_config(mode: str) -> dict:
     """
     Returns KIS account credentials for the given mode ('mock' or 'real').
     Reads values from environment variables — never returns raw key values in logs.
     Raises ValueError with a descriptive message (not the key values) if required vars are missing.
+
+    계좌번호 우선순위:
+    - mock: KIS_MOCK_CANO(+KIS_MOCK_ACNT_PRDT_CD) → KIS_MOCK_ACCOUNT_NO
+    - real: KIS_REAL_CANO(+KIS_REAL_ACNT_PRDT_CD) → KIS_ACCOUNT_NO(+KIS_ACCOUNT_PRODUCT_CODE)
     """
     cfg = get_config()
     kis_cfg = cfg._raw.get("kis", {})
 
     if mode == "mock":
         section = kis_cfg.get("mock", {})
+        cano_env_direct = "KIS_MOCK_CANO"
+        prdt_env_direct = "KIS_MOCK_ACNT_PRDT_CD"
+        legacy_cano_envs: list[str] = []
     elif mode == "real":
         section = kis_cfg.get("real", {})
+        cano_env_direct = "KIS_REAL_CANO"
+        prdt_env_direct = "KIS_REAL_ACNT_PRDT_CD"
+        legacy_cano_envs = ["KIS_ACCOUNT_NO"]
     else:
         raise ValueError(f"Unknown KIS mode: {mode}. Use 'mock' or 'real'.")
 
@@ -271,20 +300,49 @@ def get_kis_account_config(mode: str) -> dict:
 
     app_key = os.getenv(app_key_env, "")
     app_secret = os.getenv(app_secret_env, "")
-    account_no = os.getenv(account_no_env, "").strip()
-    product_code = os.getenv(product_code_env, "").strip()
 
-    # 계좌번호 정규화: KIS API는 CANO=8자리, ACNT_PRDT_CD=2자리 분리 요구
-    # 사용자가 "12345678-01" 또는 "1234567801" 로 입력한 경우 자동 분리
-    if account_no and "-" in account_no:
-        parts = account_no.split("-", 1)
-        account_no = parts[0].strip()
-        if len(parts) > 1 and not product_code:
-            product_code = parts[1].strip().zfill(2)
-    elif account_no and len(account_no) == 10 and account_no.isdigit():
-        if not product_code:
-            product_code = account_no[8:]
-        account_no = account_no[:8]
+    # 환경변수 존재 체크 (진단용)
+    env_checks: dict[str, bool] = {
+        app_key_env: bool(app_key),
+        app_secret_env: bool(app_secret),
+    }
+
+    # ── 계좌번호 해석 (우선순위 순) ──────────────────────────────────────
+    cano_source = ""
+    account_no = ""
+    product_code = ""
+
+    # 1순위: KIS_MOCK_CANO / KIS_REAL_CANO 직접 지정
+    direct_cano = os.getenv(cano_env_direct, "").strip()
+    direct_prdt = os.getenv(prdt_env_direct, "").strip()
+    env_checks[cano_env_direct] = bool(direct_cano)
+    env_checks[prdt_env_direct] = bool(direct_prdt)
+    if direct_cano:
+        account_no = direct_cano
+        product_code = direct_prdt or "01"
+        cano_source = "CANO_env"
+
+    # 2순위: config의 account_no_env (KIS_MOCK_ACCOUNT_NO / KIS_ACCOUNT_NO)
+    if not account_no:
+        raw_no = os.getenv(account_no_env, "").strip()
+        raw_prdt = os.getenv(product_code_env, "").strip()
+        env_checks[account_no_env] = bool(raw_no)
+        env_checks[product_code_env] = bool(raw_prdt)
+        if raw_no:
+            account_no, product_code = _parse_account_no(raw_no, raw_prdt)
+            cano_source = "account_no_env"
+
+    # 3순위 (real만): 레거시 alias KIS_ACCOUNT_NO + KIS_ACCOUNT_PRODUCT_CODE
+    if not account_no and legacy_cano_envs:
+        for legacy_env in legacy_cano_envs:
+            raw_no = os.getenv(legacy_env, "").strip()
+            env_checks[legacy_env] = bool(raw_no)
+            if raw_no:
+                raw_prdt = os.getenv("KIS_ACCOUNT_PRODUCT_CODE", "").strip()
+                env_checks["KIS_ACCOUNT_PRODUCT_CODE"] = bool(raw_prdt)
+                account_no, product_code = _parse_account_no(raw_no, raw_prdt)
+                cano_source = "legacy_alias"
+                break
 
     if not product_code:
         product_code = "01"
@@ -295,7 +353,7 @@ def get_kis_account_config(mode: str) -> dict:
     if not app_secret:
         missing.append(app_secret_env)
     if not account_no:
-        missing.append(account_no_env)
+        missing.append(f"{cano_env_direct} 또는 {account_no_env}")
 
     if missing:
         raise ValueError(f"필수 환경변수 누락: {', '.join(missing)}")
@@ -304,10 +362,12 @@ def get_kis_account_config(mode: str) -> dict:
         "app_key": app_key,
         "app_secret": app_secret,
         "account_no": account_no,
-        "product_code": product_code or "01",
+        "product_code": product_code,
         "base_url": section.get("base_url", ""),
         "mode": mode,
         "enabled": section.get("enabled", False),
+        "env_checks": env_checks,
+        "cano_source": cano_source,
     }
 
 
