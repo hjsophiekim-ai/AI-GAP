@@ -8,6 +8,13 @@ auto_sell_service.py — 자동매도 감시 서비스
 - 중복 주문 방지: pending_order 플래그 + state 파일 영속 저장
 """
 
+import warnings
+warnings.warn(
+    "AutoSellService is deprecated. Use IntradayAutoTradeService instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 import csv
 import json
 import math

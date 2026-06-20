@@ -391,6 +391,42 @@ class KISClient:
             logger.warning(f"[KIS] 일별주가 조회 실패 {symbol}: {e}")
             return []
 
+    # ── 분봉 조회 ──────────────────────────────────────────────────────────
+
+    def get_minute_candles(self, symbol: str, period_min: int = 1, count: int = 60) -> list[dict]:
+        """국내주식 분봉 조회. 최신 순으로 count개 반환. 실패 시 [] 반환."""
+        tr_id = "FHKST03010200"
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        headers = self._auth_headers(tr_id)
+        params = {
+            "FID_ETC_CLS_CODE": "",
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": symbol,
+            "FID_INPUT_HOUR_1": "",
+            "FID_PW_DATA_INCU_YN": "N",
+        }
+        try:
+            resp = self._session.get(url, headers=headers, params=params, timeout=10)
+            resp.raise_for_status()
+            output = resp.json().get("output2", [])
+            result = []
+            for row in output[:count]:
+                close = float(row.get("stck_prpr", 0) or 0)
+                if close <= 0:
+                    continue
+                result.append({
+                    "time": row.get("stck_cntg_hour", ""),
+                    "open": float(row.get("stck_oprc", 0) or 0),
+                    "high": float(row.get("stck_hgpr", 0) or 0),
+                    "low": float(row.get("stck_lwpr", 0) or 0),
+                    "close": close,
+                    "volume": int(row.get("cntg_vol", 0) or 0),
+                })
+            return result
+        except Exception as e:
+            logger.warning(f"[KIS] 분봉 조회 실패 {symbol}: {e}")
+            return []
+
     # ── 매수 주문 ──────────────────────────────────────────────────────────
 
     def buy(

@@ -161,6 +161,44 @@ us_sector_strength:
   moderate_threshold: 50
   request_timeout_seconds: 8
 
+intraday_auto_trade:
+  enabled: true
+  strategy_name: "sector_leader_auto_intraday"
+  target_symbols_source: "sector_leader_top3"
+  total_budget: 10000000
+  budget_allocation_method: "weighted"
+  default_weights: [0.5, 0.3, 0.2]
+  max_position_count: 3
+  use_full_budget_across_targets: true
+  candle_trigger: "1m"
+  candle_primary: "3m"
+  check_interval_seconds: 10
+  buy_start_time: "09:10"
+  buy_end_time: "14:40"
+  force_sell_time: "15:10"
+  max_total_entries_per_day: 3
+  max_entries_per_symbol: 2
+  cooldown_minutes: 10
+  allow_breakout_entry_if_no_pullback: true
+  buy_conditions:
+    min_pullback_pct: -3.8
+    max_pullback_pct: -1.2
+    min_volume_ratio: 1.15
+    min_rsi: 42
+    max_rsi: 72
+    crash_threshold_pct: -5.0
+  relaxed_buy_conditions:
+    activate_after_minutes: 60
+    min_pullback_pct: -0.8
+    min_volume_ratio: 1.0
+  sell_conditions:
+    stop_loss_pct: -1.2
+    half_take_profit_pct: 1.8
+    full_take_profit_pct: 3.2
+    trailing_stop_pct: -1.8
+  state_file: "data/state/intraday_auto_trade_state_YYYYMMDD.json"
+  log_file: "data/logs/intraday_auto_trades_YYYYMMDD.csv"
+
 logging:
   save_csv: true
   save_db: false
