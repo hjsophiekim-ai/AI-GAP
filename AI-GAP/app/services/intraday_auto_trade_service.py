@@ -200,9 +200,12 @@ class IntradayAutoTradeService:
         if self.kis_client is None:
             return []
         try:
-            return self.kis_client.get_minute_candles(symbol, period_min=1, count=60)
+            candles = self.kis_client.get_minute_candles(symbol, period_min=1, count=60)
+            if not candles:
+                logger.warning(f"[Intraday] 1분봉 빈 응답 {symbol} (장 마감 또는 API 오류)")
+            return candles or []
         except Exception as e:
-            logger.warning(f"[Intraday] 분봉 조회 실패 {symbol}: {e}")
+            logger.warning(f"[Intraday] 1분봉 조회 실패 {symbol}: {e}")
             return []
 
     def _get_current_price(self, symbol: str, state: dict) -> float:
@@ -239,6 +242,15 @@ class IntradayAutoTradeService:
 
         if len(candles_1m) < 5:
             return False, "insufficient_candle_data"
+
+        # 3분봉 최소 5개 미만이면 지표 계산 불가
+        candles_3m_pre = resample_1m_to_3m(candles_1m)
+        if len(candles_3m_pre) < 5:
+            logger.warning(
+                f"[Intraday] 3분봉 부족 {symbol}: 1분봉={len(candles_1m)}개 "
+                f"→ 3분봉={len(candles_3m_pre)}개 (최소 5개 필요)"
+            )
+            return False, "insufficient_3m_candles"
 
         # 표준 조건 체크
         ok, reason = self._standard_buy_check(symbol, state, candles_1m, current_price)

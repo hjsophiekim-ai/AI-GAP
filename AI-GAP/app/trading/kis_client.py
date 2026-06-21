@@ -31,7 +31,8 @@ TR_SELL_MOCK = "VTTC0801U"
 TR_ORDER_HISTORY_REAL = "TTTC8001R"   # 공식 문서 확인 필요
 TR_ORDER_HISTORY_MOCK = "VTTC8001R"   # 공식 문서 확인 필요
 
-TR_DAILY_PRICE = "FHKST01010400"      # 국내주식 일별 주가
+TR_DAILY_PRICE   = "FHKST01010400"    # 국내주식 일별 주가
+TR_MINUTE_CHART  = "FHKST03010200"    # 국내주식 1분봉 (inquire-time-itemchartprice)
 
 ORD_DVSN_LIMIT = "00"
 ORD_DVSN_MARKET = "01"
@@ -304,6 +305,106 @@ class KISClient:
             return result
         except Exception as e:
             logger.warning(f"[KIS] 일별주가 조회 실패 {symbol}: {e}")
+            return []
+
+    # ── 1분봉 조회 ────────────────────────────────────────────────────────
+
+    def get_minute_candles(self, symbol: str, period_min: int = 1, count: int = 30) -> list[dict]:
+        """
+        국내주식 1분봉 조회 (inquire-time-itemchartprice, TR: FHKST03010200).
+
+        period_min: 현재 1만 지원. 다른 값은 [] 반환.
+        count: 요청 봉 수. KIS API 1회당 최대 30개 → 60개 이하는 최대 2회 호출.
+        반환 형식 (newest-first):
+          [{"time": "HHMMss", "open": float, "high": float,
+            "low": float, "close": float, "volume": int}, ...]
+        실패 시 [] 반환 (앱 전체 중단 없음).
+        """
+        if period_min != 1:
+            logger.warning(f"[KIS-{self.mode.upper()}] get_minute_candles: period_min={period_min} 미지원")
+            return []
+
+        all_candles: list[dict] = []
+        page_size    = 30
+        max_pages    = min(2, (count + page_size - 1) // page_size)
+        query_time   = datetime.now()
+
+        for _page in range(max_pages):
+            if len(all_candles) >= count:
+                break
+            time_str   = query_time.strftime("%H%M%S")
+            page_data  = self._fetch_minute_candles_page(symbol, time_str)
+            if not page_data:
+                break
+            all_candles.extend(page_data)
+
+            # 다음 페이지: 마지막 캔들 시각 -1분
+            last_t = all_candles[-1].get("time", "")
+            if len(last_t) >= 6:
+                try:
+                    h = int(last_t[0:2])
+                    m = int(last_t[2:4])
+                    s = int(last_t[4:6])
+                    query_time = query_time.replace(hour=h, minute=m, second=s)
+                    query_time = query_time - timedelta(minutes=1)
+                except Exception:
+                    break
+            else:
+                break
+
+        result = all_candles[:count]
+        logger.debug(
+            f"[KIS-{self.mode.upper()}] 1분봉 {symbol}: 요청={count} 수신={len(result)}"
+        )
+        return result
+
+    def _fetch_minute_candles_page(self, symbol: str, hour_str: str) -> list[dict]:
+        """
+        1분봉 단일 페이지(최대 30개) 조회.
+        반환: newest-first candle list, 오류 시 []
+        """
+        url     = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        headers = self._auth_headers(TR_MINUTE_CHART)
+        params  = {
+            "FID_ETC_CLS_CODE":       "",
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD":         symbol,
+            "FID_INPUT_HOUR_1":       hour_str,
+            "FID_PW_DATA_INCU_YN":    "N",
+        }
+        try:
+            resp = self._session.get(url, headers=headers, params=params, timeout=10)
+            # KIS 서버가 500을 반환해도 JSON body에 유효한 데이터가 있을 수 있음
+            # → raise_for_status() 대신 rt_cd로 성공 여부 판단
+            try:
+                data = resp.json()
+            except Exception:
+                resp.raise_for_status()
+                return []
+            rt_cd = data.get("rt_cd", "")
+            if rt_cd != "0":
+                logger.warning(
+                    f"[KIS-{self.mode.upper()}] 1분봉 오류: rt_cd={rt_cd} "
+                    f"msg={data.get('msg1', '')} symbol={symbol}"
+                )
+                return []
+            rows    = data.get("output2") or []
+            candles = []
+            for row in rows:
+                close = float(row.get("stck_prpr", 0) or 0)
+                if close <= 0:
+                    continue
+                candles.append({
+                    "time":   row.get("stck_cntg_hour", "000000"),
+                    "open":   float(row.get("stck_oprc", close) or close),
+                    "high":   float(row.get("stck_hgpr", close) or close),
+                    "low":    float(row.get("stck_lwpr", close) or close),
+                    "close":  close,
+                    "volume": int(row.get("cntg_vol", 0) or 0),
+                })
+            return candles
+        except Exception as e:
+            logger.warning(f"[KIS-{self.mode.upper()}] 1분봉 페이지 조회 실패 {symbol}: {e}")
             return []
 
     # ── 매수 주문 ──────────────────────────────────────────────────────────
