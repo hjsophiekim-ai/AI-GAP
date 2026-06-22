@@ -147,3 +147,42 @@ def calculate_intraday_high_pullback(current_price: float, intraday_high: float)
     if intraday_high <= 0:
         return 0.0
     return (current_price - intraday_high) / intraday_high * 100.0
+
+
+def calculate_ema_slope(ema_values: list[float]) -> float:
+    """EMA slope (newest - second newest). 양수 = 상승 추세."""
+    if len(ema_values) < 2:
+        return 0.0
+    return ema_values[0] - ema_values[1]
+
+
+def detect_williams_fractal_buy(candles: list[dict], lookback: int = 2) -> bool:
+    """Williams Fractal 매수 신호 (하향 프랙탈 → 반전 상승 신호).
+
+    최소 2*lookback+1개 캔들 필요. newest-first 입력.
+    중심 캔들의 low가 주변 lookback개보다 낮으면 fractal bottom.
+    """
+    needed = 2 * lookback + 1
+    if len(candles) < needed:
+        return False
+    old_first = list(reversed(candles[:needed]))
+    center_idx = lookback
+    center_low = old_first[center_idx]["low"]
+    for i in range(needed):
+        if i == center_idx:
+            continue
+        if old_first[i]["low"] <= center_low:
+            return False
+    return True
+
+
+def calculate_volume_ratio(candles: list[dict], lookback: int = 3) -> float:
+    """최신 1분봉 거래량 / 직전 lookback개 평균."""
+    if len(candles) < lookback + 1:
+        return 0.0
+    latest_vol = candles[0]["volume"]
+    prior_vols = [c["volume"] for c in candles[1:lookback + 1]]
+    avg = sum(prior_vols) / len(prior_vols) if prior_vols else 0
+    if avg == 0:
+        return 0.0
+    return latest_vol / avg

@@ -93,14 +93,67 @@ def _run_test(mode: str, test_name: str) -> None:
         if client is None:
             st.warning("먼저 토큰을 발급하세요.")
             return
-        with st.spinner("계좌 잔고 조회 중..."):
+        with st.spinner("계좌 잔고 및 주문가능금액 조회 중..."):
             try:
+                bd = client.get_account_cash_breakdown()
                 balance = client.get_balance()
                 if "error" not in balance:
-                    cash = balance.get("cash", 0)
+                    withdrawable = bd.get("withdrawable_amount", balance.get("cash", 0))
+                    ord_psbl_cash = bd.get("ord_psbl_cash", 0)      # 현금성 주문가능
+                    nrcvb_buy_amt = bd.get("nrcvb_buy_amt", 0)      # 재매수가능금액 (앱 기준)
+                    orderable = bd.get("orderable_cash", 0)          # 프로그램 사용 기준
+                    settlement_pending = bd.get("settlement_pending_cash", 0)
                     pos_cnt = len(balance.get("positions", []))
-                    st.success(f"예수금: **{cash:,.0f}원** | 보유종목: **{pos_cnt}개**")
+
+                    # 종목별 매수가능금액 조회
+                    try:
+                        stock_buyable = client.get_stock_buyable_amount("005930", 0)
+                    except Exception:
+                        stock_buyable = orderable
+
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric(
+                        "인출가능금액 (출금 가능)",
+                        f"{withdrawable:,.0f}원",
+                        help="dnca_tot_amt — 실제로 출금 가능한 금액. 매수 기준이 아님."
+                    )
+                    col2.metric(
+                        "재매수가능금액 (앱 기준)",
+                        f"{nrcvb_buy_amt:,.0f}원",
+                        help="nrcvb_buy_amt — 앱의 '주문가능금액'과 일치하는 후보 필드. "
+                             "D+2 결제 전 매도대금 포함."
+                    )
+                    col3.metric(
+                        "AI-GAP 매수 기준 금액",
+                        f"{orderable:,.0f}원",
+                        help="max(nrcvb_buy_amt, ord_psbl_cash) — 프로그램이 매수 한도로 사용하는 값."
+                    )
+                    col4, col5 = st.columns(2)
+                    col4.metric(
+                        "순수 현금성 주문가능",
+                        f"{ord_psbl_cash:,.0f}원",
+                        help="ord_psbl_cash — 현금성 주문가능금액. D+2 매도대금 미포함."
+                    )
+                    col5.metric(
+                        "종목별 매수가능 (005930 기준)",
+                        f"{stock_buyable:,.0f}원",
+                        help="inquire-psbl-order API 기준 삼성전자(005930) 매수가능금액."
+                    )
+
+                    if settlement_pending > 0:
+                        st.info(
+                            f"D+2 미결제 추정 매도대금: **{settlement_pending:,.0f}원** — "
+                            "매수는 가능하나 인출(출금)은 불가합니다."
+                        )
+
+                    st.caption(
+                        "인출가능금액은 출금 가능 금액입니다. 금요일 매도 등 결제 전 매도대금은 "
+                        "인출가능금액에는 반영되지 않지만 국내주식 재매수 가능금액에 포함될 수 있습니다. "
+                        "AI-GAP은 매수 판단 시 인출가능금액이 아니라 종목별 매수가능금액을 사용합니다."
+                    )
+                    st.info(f"보유종목: **{pos_cnt}개**")
                     st.session_state[f"{mode}_balance"] = balance
+                    st.session_state[f"{mode}_breakdown"] = bd
                 else:
                     err = balance.get("error", "")
                     st.error(f"잔고 조회 실패: {err}")
@@ -235,6 +288,7 @@ with tab_real:
     real_ok = st.session_state.get("real_token_ok", False)
     real_buyable = st.session_state.get("real_buyable")
     real_balance = st.session_state.get("real_balance")
+    real_breakdown = st.session_state.get("real_breakdown", {})
 
     col_a, col_b, col_c = st.columns(3)
     with col_a:
@@ -243,17 +297,22 @@ with tab_real:
         else:
             st.error("토큰: 미발급")
     with col_b:
+        withdrawable = real_breakdown.get("withdrawable_amount", real_balance.get("cash", 0) if real_balance else 0)
         if real_balance and "error" not in real_balance:
-            st.success(f"예수금: {real_balance.get('cash', 0):,.0f}원")
+            st.success(f"인출가능: {withdrawable:,.0f}원")
         else:
-            st.warning("예수금: 미조회")
+            st.warning("인출가능금액: 미조회")
     with col_c:
-        if real_buyable is not None:
+        nrcvb = real_breakdown.get("nrcvb_buy_amt", 0)
+        orderable = real_breakdown.get("orderable_cash", real_buyable or 0)
+        if real_breakdown:
+            st.success(f"AI-GAP 매수기준: {orderable:,.0f}원")
+        elif real_buyable is not None:
             st.success(f"주문가능: {real_buyable:,.0f}원")
         else:
             st.warning("주문가능금액: 미조회")
 
-    if real_ok and real_buyable is not None and real_buyable > 0:
+    if real_ok and orderable > 0:
         st.success("Real 계좌 주문 가능 상태입니다.")
     elif real_ok:
         st.warning("토큰은 발급됐지만 주문가능금액을 확인하세요.")

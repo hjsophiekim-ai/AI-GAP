@@ -247,6 +247,52 @@ class Config:
             or self.safety.get("real_confirm_text", "REAL_ORDER_CONFIRMED")
         )
 
+    def get_real_order_limits(self) -> dict:
+        """실계좌 주문 안전한도 조회. 우선순위: env vars → config.yaml → 기본값."""
+        import os
+        safety = self.safety
+
+        def _read(env_names: list, config_keys: list, default: float) -> float:
+            for env in env_names:
+                v = os.getenv(env, "")
+                if v:
+                    try:
+                        return float(v)
+                    except ValueError:
+                        pass
+            for key in config_keys:
+                v = safety.get(key)
+                if v is not None:
+                    try:
+                        return float(v)
+                    except (ValueError, TypeError):
+                        pass
+            return default
+
+        per_order = _read(
+            ["REAL_MAX_ORDER_AMOUNT", "MAX_REAL_ORDER_AMOUNT", "REAL_ORDER_MAX_AMOUNT"],
+            ["max_order_amount", "max_real_order_amount"],
+            5_000_000.0,
+        )
+        daily = _read(
+            ["REAL_MAX_DAILY_ORDER_AMOUNT", "MAX_REAL_DAILY_BUDGET"],
+            ["max_daily_order_amount", "max_real_daily_budget"],
+            30_000_000.0,
+        )
+        per_symbol = _read(
+            ["REAL_MAX_POSITION_AMOUNT_PER_SYMBOL"],
+            ["max_position_amount_per_symbol"],
+            10_000_000.0,
+        )
+        auto_reduce = os.getenv("AUTO_REDUCE_QUANTITY_ON_SAFETY_LIMIT", "true").lower() in ("true", "1", "yes")
+
+        return {
+            "per_order": per_order,
+            "daily": daily,
+            "per_symbol": per_symbol,
+            "auto_reduce": auto_reduce,
+        }
+
 
 def _parse_account_no(raw: str, product_code: str = "") -> tuple[str, str]:
     """계좌번호 원문을 (CANO 8자리, ACNT_PRDT_CD 2자리)로 파싱.

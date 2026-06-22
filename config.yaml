@@ -92,15 +92,16 @@ safety:
   real_order_confirm_text: "REAL_ORDER_CONFIRMED"
 
   # ── 주문 한도 ──────────────────────────────────────────────────────────────
-  max_order_amount: 1000000       # 건당 최대 주문금액 (원)
-  max_daily_order_amount: 3000000 # 일일 최대 주문금액 (원)
+  max_order_amount: 5000000       # 건당 최대 주문금액 (원)
+  max_daily_order_amount: 30000000 # 일일 최대 주문금액 (원)
+  max_position_amount_per_symbol: 10000000 # 종목당 최대 보유금액 (원)
   max_daily_loss_rate: -5.0
 
   # ── 하위 호환 (기존 키 유지) ───────────────────────────────────────────────
   require_real_confirm: true
   real_confirm_text: "REAL_ORDER_CONFIRMED"
-  max_real_order_amount: 1000000
-  max_real_daily_budget: 3000000
+  max_real_order_amount: 5000000
+  max_real_daily_budget: 30000000
 
 volume_spike:
   enabled: true
@@ -164,19 +165,48 @@ us_sector_strength:
 
 intraday_auto_trade:
   enabled: true
-  strategy_name: "sector_leader_auto_intraday"
+  strategy_name: "top3_timed_buy_3pct_takeprofit"   # 기본 전략
   target_symbols_source: "sector_leader_top3"
-  total_budget: 10000000
-  budget_allocation_method: "weighted"
-  default_weights: [0.5, 0.3, 0.2]
-  max_position_count: 3
-  use_full_budget_across_targets: true
-  candle_trigger: "1m"
-  candle_primary: "3m"
+
+  # ── top3_timed_buy_3pct_takeprofit 전략 설정 ─────────────────────────────
+  buy_mode: "timed_top3"
+  sell_mode: "take_profit_monitor"
+  buy_window_start: "09:10"
+  buy_window_end: "09:30"
+  buy_schedule:
+    rank1: "09:12"
+    rank2: "09:16"
+    rank3: "09:20"
+  budget_allocation:
+    rank1: 0.45
+    rank2: 0.35
+    rank3: 0.20
+  use_market_order: true
   check_interval_seconds: 10
+  take_profit_pct: 3.0
+  stop_loss_enabled: true
+  stop_loss_pct: -1.2
+  trailing_stop_enabled: false
+  force_exit_enabled: true
+  force_exit_time: "15:10"
+  max_buy_per_symbol_per_day: 1
+  max_sell_per_symbol_per_day: 1
+  max_total_buy_symbols: 3
+  minimum_safety_filter_enabled: true
+  min_change_rate_at_buy: -1.0
+  max_drop_from_intraday_high_pct: 5.0
+  exclude_etf: true
+  exclude_etn: true
+  exclude_preferred: true
+  exclude_spac: true
+  exclude_reit: true
+  exclude_suspended: true
+
+  # ── 기존 master_pullback_top3_multi_entry 전략용 설정 (하위 호환) ─────────
+  total_budget: 10000000
+  max_position_count: 3
   buy_start_time: "09:10"
   buy_end_time: "14:40"
-  force_sell_time: "15:10"
   max_total_entries_per_day: 3
   max_entries_per_symbol: 2
   cooldown_minutes: 10

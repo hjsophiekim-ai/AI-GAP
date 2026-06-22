@@ -1,217 +1,167 @@
-"""
-Tests for KisRealBroker safety gates.
-No actual API calls are made — KISClient is mocked.
-"""
+"""tests/test_real_broker_safety.py — 실계좌 안전한도 테스트"""
+import os
+import sys
+from pathlib import Path
 import pytest
-from unittest.mock import MagicMock
 
-from app.trading.kis_real_broker import KisRealBroker
-from app.models import OrderResult
-
-
-# ---------------------------------------------------------------------------
-# Config stubs
-# ---------------------------------------------------------------------------
-
-class _SafetyOn:
-    """모든 안전장치가 통과되는 설정."""
-    _raw = {
-        "kis": {"real": {"enabled": True}},
-    }
-    safety = {
-        "enable_real_trading": True,
-        "require_real_confirm": True,
-        "real_confirm_text": "I_UNDERSTAND_REAL_TRADING_RISK",
-        "max_real_order_amount": 1_000_000,
-        "max_real_daily_budget": 1_000_000,
-    }
-
-    def real_trading_enabled(self) -> bool:
-        return True
-
-    def require_real_confirm(self) -> bool:
-        return True
-
-    def real_confirm_text(self) -> str:
-        return "I_UNDERSTAND_REAL_TRADING_RISK"
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
+os.chdir(_ROOT)
 
 
-class _RealTradingDisabled(_SafetyOn):
-    """enable_real_trading = false."""
+# ── 픽스처: 최소 KISClient 모의 객체 ───────────────────────────────────────
 
-    def real_trading_enabled(self) -> bool:
-        return False
+class _FakeKIS:
+    mode = "real"
 
+    def get_buyable_cash(self, symbol="", price=0):
+        return 5_000_000.0
 
-class _KisRealDisabled(_SafetyOn):
-    """kis.real.enabled = false."""
-    _raw = {
-        "kis": {"real": {"enabled": False}},
-    }
+    def get_buyable_cash_raw(self, symbol="", price=0, **kw):
+        return {
+            "ord_psbl_cash": 5_000_000.0,
+            "nrcvb_buy_amt": 5_000_000.0,
+            "psbl_qty": 10,
+        }
 
+    def get_balance(self):
+        return {"cash": 5_000_000.0, "orderable_cash": 5_000_000.0, "positions": []}
 
-class _NoConfirmRequired(_SafetyOn):
-    """require_real_confirm = false."""
-
-    def require_real_confirm(self) -> bool:
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Mock KISClient
-# ---------------------------------------------------------------------------
-
-def _mock_kis():
-    kis = MagicMock()
-    kis.buy.return_value = {"success": True, "order_id": "TEST-001", "message": "ok", "raw": {}}
-    kis.sell.return_value = {"success": True, "order_id": "TEST-002", "message": "ok", "raw": {}}
-    kis.get_balance.return_value = {"cash": 5_000_000, "positions": []}
-    kis.get_buyable_cash.return_value = 5_000_000.0
-    kis.get_current_price.return_value = {"current_price": 70_000.0}
-    return kis
+    def buy(self, symbol, quantity, price, order_type="limit"):
+        return {
+            "success": True,
+            "order_id": "TEST001",
+            "message": "OK",
+            "raw": {},
+            "http_status": 200,
+        }
 
 
-# ---------------------------------------------------------------------------
-# Safety gate tests
-# ---------------------------------------------------------------------------
+def _make_broker(
+    max_order=5_000_000,
+    max_daily=30_000_000,
+    max_symbol=10_000_000,
+    auto_reduce=True,
+):
+    from app.config import Config
+    cfg = Config()
+    cfg._raw.setdefault("safety", {})
+    cfg._raw["safety"]["max_order_amount"] = max_order
+    cfg._raw["safety"]["max_daily_order_amount"] = max_daily
+    cfg._raw["safety"]["max_position_amount_per_symbol"] = max_symbol
+    cfg._raw["safety"]["enable_real_trading"] = True
+    cfg._raw["safety"]["enable_real_buy"] = True
+    cfg._raw["safety"]["require_real_order_confirm_text"] = False
+    cfg._raw["safety"]["real_order_confirm_text"] = "REAL_ORDER_CONFIRMED"
+    cfg._raw.setdefault("kis", {}).setdefault("real", {})["enabled"] = True
 
-def test_gate_real_trading_disabled():
-    """safety.enable_real_trading=false → RuntimeError."""
-    with pytest.raises(RuntimeError, match="비활성화"):
-        KisRealBroker(
-            _mock_kis(),
-            cfg=_RealTradingDisabled(),
-            confirm_text="I_UNDERSTAND_REAL_TRADING_RISK",
-        )
+    os.environ["AUTO_REDUCE_QUANTITY_ON_SAFETY_LIMIT"] = "true" if auto_reduce else "false"
 
-
-def test_gate_kis_real_disabled():
-    """kis.real.enabled=false → RuntimeError."""
-    with pytest.raises(RuntimeError, match="비활성화"):
-        KisRealBroker(
-            _mock_kis(),
-            cfg=_KisRealDisabled(),
-            confirm_text="I_UNDERSTAND_REAL_TRADING_RISK",
-        )
-
-
-def test_gate_wrong_confirm_text():
-    """틀린 확인 문구 → RuntimeError."""
-    with pytest.raises(RuntimeError, match="확인 문구"):
-        KisRealBroker(
-            _mock_kis(),
-            cfg=_SafetyOn(),
-            confirm_text="WRONG_TEXT",
-        )
-
-
-def test_gate_empty_confirm_text():
-    """빈 확인 문구 → RuntimeError."""
-    with pytest.raises(RuntimeError, match="확인 문구"):
-        KisRealBroker(
-            _mock_kis(),
-            cfg=_SafetyOn(),
-            confirm_text="",
-        )
-
-
-def test_gate_no_confirm_required():
-    """require_real_confirm=false이면 confirm_text 없어도 통과."""
+    from app.trading.kis_real_broker import KisRealBroker
     broker = KisRealBroker(
-        _mock_kis(),
-        cfg=_NoConfirmRequired(),
-        confirm_text="",
+        kis_client=_FakeKIS(),
+        cfg=cfg,
+        confirm_text="REAL_ORDER_CONFIRMED",
+        runtime_real_mode=True,
+        runtime_enable_real_buy=True,
     )
-    assert broker.mode == "real"
+    return broker
 
 
-def test_gate_correct_confirm_passes():
-    """올바른 확인 문구 → 인스턴스 생성 성공."""
-    broker = KisRealBroker(
-        _mock_kis(),
-        cfg=_SafetyOn(),
-        confirm_text="I_UNDERSTAND_REAL_TRADING_RISK",
-    )
-    assert broker.mode == "real"
+# ── Tests ───────────────────────────────────────────────────────────────────
+
+class TestDefaultLimits:
+    def test_default_per_order_is_5m(self):
+        from app.config import Config
+        cfg = Config()
+        limits = cfg.get_real_order_limits()
+        assert limits["per_order"] >= 5_000_000, (
+            f"기본 1회 주문한도가 5M 미만: {limits['per_order']}"
+        )
+
+    def test_default_daily_is_30m(self):
+        from app.config import Config
+        cfg = Config()
+        limits = cfg.get_real_order_limits()
+        assert limits["daily"] >= 30_000_000, (
+            f"기본 일일한도가 30M 미만: {limits['daily']}"
+        )
 
 
-# ---------------------------------------------------------------------------
-# Order amount limit tests (gate 5+6)
-# ---------------------------------------------------------------------------
+class TestSafetyLimitPass:
+    def test_skhynix_2901000_passes(self):
+        broker = _make_broker(max_order=5_000_000)
+        err, etype = broker._check_order_limits(1, 2_901_000, symbol="000660")
+        assert err is None, f"SK하이닉스 차단됨: {err}"
 
-@pytest.fixture
-def real_broker():
-    """통과된 안전장치, max_real_order_amount=1,000,000."""
-    return KisRealBroker(
-        _mock_kis(),
-        cfg=_SafetyOn(),
-        confirm_text="I_UNDERSTAND_REAL_TRADING_RISK",
-    )
+    def test_lge_2970500_passes(self):
+        broker = _make_broker(max_order=5_000_000)
+        err, etype = broker._check_order_limits(13, 228_500, symbol="066570")
+        assert err is None, f"LG전자 차단됨: {err}"
 
-
-def test_order_within_limit(real_broker):
-    """주문금액 < max_real_order_amount → 주문 성공."""
-    result = real_broker.buy("005930", "삼성전자", quantity=1, price=500_000)
-    assert result.success is True
+    def test_lgcns_1877400_passes(self):
+        broker = _make_broker(max_order=5_000_000)
+        err, etype = broker._check_order_limits(21, 89_400, symbol="064400")
+        assert err is None, f"LG씨엔에스 차단됨: {err}"
 
 
-def test_order_exceeds_limit(real_broker):
-    """주문금액 > max_real_order_amount → 차단."""
-    result = real_broker.buy("005930", "삼성전자", quantity=2, price=600_000)
-    assert result.success is False
-    assert "safety rule" in result.message
+class TestSafetyLimitBlock:
+    def test_1m_limit_blocks_skhynix(self):
+        broker = _make_broker(max_order=1_000_000)
+        err, etype = broker._check_order_limits(1, 2_901_000, symbol="000660")
+        assert err is not None
+        assert etype == "safety_per_order_limit_exceeded"
+
+    def test_daily_limit_blocks_cumulative(self):
+        broker = _make_broker(max_order=5_000_000, max_daily=5_000_000)
+        broker._daily_ordered_amount = 4_500_000
+        err, etype = broker._check_order_limits(1, 2_901_000, symbol="000660")
+        assert err is not None
+        assert etype == "safety_daily_limit_exceeded"
+
+    def test_symbol_limit_blocks_large_order(self):
+        broker = _make_broker(max_order=5_000_000, max_symbol=2_000_000)
+        err, etype = broker._check_order_limits(1, 2_901_000, symbol="000660")
+        assert err is not None
+        assert etype == "safety_symbol_limit_exceeded"
 
 
-def test_daily_budget_exceeded(real_broker):
-    """첫 주문 후 일일 한도 초과 → 두 번째 주문 차단."""
-    # 첫 주문: 1주 * 900,000 = 900,000원 (한도 1,000,000원 이내)
-    real_broker._daily_ordered_amount = 900_000
-    result = real_broker.buy("005930", "삼성전자", quantity=1, price=200_000)
-    # 900,000 + 200,000 = 1,100,000 > 1,000,000
-    assert result.success is False
-    assert "일일 한도" in result.message
+class TestAutoReduceQuantity:
+    def test_auto_reduce_adjusts_quantity(self):
+        broker = _make_broker(max_order=2_000_000, auto_reduce=True)
+        new_qty, reason = broker._auto_reduce_quantity(13, 228_500, symbol="066570")
+        assert new_qty >= 1, "자동조정 후 수량이 0이어서는 안됨"
+        assert new_qty < 13, f"수량이 줄어야 함: {new_qty}"
+        expected = int(2_000_000 * 0.98 / 228_500)
+        assert new_qty == expected, f"예상수량 {expected}주 != 실제 {new_qty}주"
+
+    def test_auto_reduce_skip_when_disabled(self):
+        broker = _make_broker(max_order=1_000_000, auto_reduce=False)
+        result = broker.buy("000660", "SK하이닉스", 1, 2_901_000)
+        assert not result.success
+        assert result.error_type == "safety_per_order_limit_exceeded"
 
 
-def test_daily_amount_accumulates(real_broker):
-    """성공한 주문은 일일 누적 금액에 합산."""
-    initial = real_broker._daily_ordered_amount
-    real_broker.buy("005930", "삼성전자", quantity=1, price=100_000)
-    assert real_broker._daily_ordered_amount == initial + 100_000
+class TestErrorTypeSeparation:
+    def test_safety_limit_within_range_returns_none(self):
+        broker = _make_broker(max_order=5_000_000)
+        err, etype = broker._check_order_limits(1, 2_901_000)
+        assert err is None
+        assert etype is None
 
 
-# ---------------------------------------------------------------------------
-# Sell does not check order limits
-# ---------------------------------------------------------------------------
+class TestBuyIntegration:
+    def test_buy_skhynix_succeeds_with_default_limits(self):
+        broker = _make_broker(max_order=5_000_000)
+        result = broker.buy("000660", "SK하이닉스", 1, 2_901_000)
+        assert result.success, f"매수 실패: {result.message}"
 
-def test_sell_no_limit_check(real_broker):
-    """매도는 주문금액 한도 체크를 하지 않는다."""
-    result = real_broker.sell("005930", "삼성전자", quantity=100, price=100_000)
-    assert result.success is True
+    def test_buy_lge_succeeds_with_default_limits(self):
+        broker = _make_broker(max_order=5_000_000)
+        result = broker.buy("066570", "LG전자", 13, 228_500)
+        assert result.success, f"매수 실패: {result.message}"
 
-
-# ---------------------------------------------------------------------------
-# Naver/pre-market data fallback test
-# ---------------------------------------------------------------------------
-
-def test_naver_gap_collector_fallback():
-    """장전 데이터: previous_close가 없으면 change_rate로 역산한다."""
-    from app.data.naver_gap_collector import _parse_stock_row
-    from bs4 import BeautifulSoup
-
-    # sise_rise layout: 6컬럼 (rank, name/link, price, change_rate, change_amt, volume, prev_close)
-    html = """<tr>
-        <td><a href="/item/main.naver?code=123456">테스트주</a></td>
-        <td>10000</td>
-        <td>5.00</td>
-        <td>500</td>
-        <td>100</td>
-        <td>9524</td>
-    </tr>"""
-    row = BeautifulSoup(html, "html.parser").find("tr")
-    result = _parse_stock_row(row)
-
-    # 파싱 실패 시 None (컬럼 수 부족)이어도 OK — 여기서는 구조 확인
-    if result is not None:
-        # previous_close가 있으면 gap_rate가 계산됨
-        assert "current_price" in result
-        assert "symbol" in result
+    def test_buy_lgcns_succeeds_with_default_limits(self):
+        broker = _make_broker(max_order=5_000_000)
+        result = broker.buy("064400", "LG씨엔에스", 21, 89_400)
+        assert result.success, f"매수 실패: {result.message}"

@@ -1,0 +1,7 @@
+{
+  "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJ0b2tlbiIsImF1ZCI6ImUwNzlmNWY1LWEzNzMtNDNlMS1hOGU3LTk1MDZhNDM0MjEyYiIsInByZHRfY2QiOiIiLCJpc3MiOiJ1bm9ndyIsImV4cCI6MTc4MjE5MzcwNSwiaWF0IjoxNzgyMTA3MzA1LCJqdGkiOiJQU1NKZUlQUVRnM0NwY29ZaFo0azdrT1ZUM3ozU3RIRGo2VXAifQ.HGFEi3m75TtZmC-fnuIUiqpPgTc_s31nmZSoeUqeQYLiXAaSpTLAEGbe9CeEkwtFmitP87jj9LXg7nB7ynTCzg",
+  "expires_at": "2026-06-23T14:48:29.004563",
+  "mode": "mock",
+  "app_key_hash": "b44fdde21cd0f7ca",
+  "base_url": "https://openapivts.koreainvestment.com:29443"
+}

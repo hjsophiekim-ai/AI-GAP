@@ -44,9 +44,6 @@ ETF_ETN_KEYWORDS = [
     "KODEX", "TIGER", "ACE", "SOL", "PLUS", "KBSTAR", "KOSEF",
     "HANARO", "ARIRANG", "ETN", "ETF", "레버리지", "인버스", "선물",
     "합성", "TR", "RISE", "FOCUS", "TREX", "TIMEFOLIO", "WOORI",
-    # WON 계열 ETF / 채권·지수 상품 추가
-    "WON", "채권", "국고채", "코스피200", "코스닥150", "나스닥", "S&P",
-    "미국", "선진국", "신흥국", "글로벌", "달러",
 ]
 
 SPAC_KEYWORDS = ["스팩", "SPAC"]
@@ -314,6 +311,13 @@ class CandidateQualityFilter:
             max_gap = qcfg.get("max_open_gap_rate", 12.0)
             if c.gap_rate > max_gap:
                 return f"갭과다({c.gap_rate:.1f}% > {max_gap}%)"
+
+        # 시초가 대비 낙폭 하드 제외 (기본 50% 이상 하락)
+        max_drop_from_open = float(qcfg.get("max_drop_from_open_rate", 50.0))
+        if c.open > 0 and max_drop_from_open > 0:
+            drop_from_open = (c.current_price - c.open) / c.open * 100.0
+            if drop_from_open <= -max_drop_from_open:
+                return f"시초가대비낙폭({drop_from_open:.1f}% ≤ -{max_drop_from_open}%)"
 
         return None
 

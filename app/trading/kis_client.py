@@ -263,6 +263,10 @@ class KISClient:
             logger.error(f"[KIS-{self.mode.upper()}] 토큰 발급 실패: {e}")
             raise
 
+    def ensure_token(self) -> str:
+        """get_access_token() 인터페이스 호환 alias — diagnose/test 스크립트용."""
+        return self.get_access_token()
+
     def _auth_headers(self, tr_id: str) -> dict:
         token = self.get_access_token()
         return {
@@ -321,7 +325,14 @@ class KISClient:
     # ── 잔고 조회 ──────────────────────────────────────────────────────────
 
     def get_balance(self) -> dict:
-        """계좌 잔고 조회. 실패 시 {"cash": 0, "positions": [], "error": str} 반환."""
+        """계좌 잔고 조회.
+        반환: {
+            "cash": float,           # 예탁금총금액(dnca_tot_amt) — 인출 기준
+            "orderable_cash": float, # 주문가능현금(ord_psbl_cash) — 매수 기준
+            "positions": list,
+            "error": str (실패 시만)
+        }
+        """
         tr_id = TR_BALANCE_MOCK if self.mode == "mock" else TR_BALANCE_REAL
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
         headers = self._auth_headers(tr_id)
@@ -352,10 +363,15 @@ class KISClient:
                     f"rt_cd={rt_cd} msg1={msg1} msg2={msg2}"
                 )
                 detail = f"{msg1}" + (f" / {msg2}" if msg2 else "")
-                return {"cash": 0.0, "positions": [], "error": f"rt_cd={rt_cd}: {detail}"}
+                return {"cash": 0.0, "orderable_cash": 0.0, "positions": [],
+                        "error": f"rt_cd={rt_cd}: {detail}"}
 
             output2 = data.get("output2") or [{}]
-            cash = float((output2[0] if output2 else {}).get("dnca_tot_amt", 0))
+            o2 = output2[0] if output2 else {}
+            # dnca_tot_amt: 예탁금총금액 (=인출가능금액 근사치, 결제 전 매도대금 미포함)
+            cash = float(o2.get("dnca_tot_amt", 0))
+            # ord_psbl_cash: 주문가능현금 (=실제 매수에 사용할 금액, D+2 매도대금 포함)
+            orderable_cash = float(o2.get("ord_psbl_cash", 0))
 
             positions = []
             for item in (data.get("output1") or []):
@@ -371,37 +387,145 @@ class KISClient:
                 })
             logger.info(
                 f"[KIS-{self.mode.upper()}] 잔고 조회 성공: "
-                f"{len(positions)}종목 현금={cash:,.0f}원"
+                f"{len(positions)}종목 예탁금={cash:,.0f}원 주문가능={orderable_cash:,.0f}원"
             )
-            return {"cash": cash, "positions": positions}
+            return {"cash": cash, "orderable_cash": orderable_cash, "positions": positions}
         except Exception as e:
             logger.error(f"[KIS-{self.mode.upper()}] 잔고 조회 예외: {e}")
-            return {"cash": 0.0, "positions": [], "error": str(e)}
+            return {"cash": 0.0, "orderable_cash": 0.0, "positions": [], "error": str(e)}
+
+    def get_account_cash_breakdown(self) -> dict:
+        """계좌 현금 상세 분리 조회.
+        반환: {
+            "withdrawable_amount": float,   # 인출가능금액(dnca_tot_amt)
+            "cash_balance": float,          # 예수금(예탁금총금액 동일)
+            "orderable_cash": float,        # 주문가능현금 (ord_psbl_cash + nrcvb_buy_amt 최대값)
+            "ord_psbl_cash": float,         # 순수 현금성 주문가능금액 (= 인출가능 근사)
+            "nrcvb_buy_amt": float,         # 재매수가능금액 (D+2 매도대금 포함 — 앱 주문가능금액)
+            "buyable_amount": float,        # orderable_cash 와 동일
+            "settlement_pending_cash": float, # 결제 전 매도대금 추정 (orderable - withdrawable)
+            "raw_fields": dict,
+        }
+        """
+        bal = self.get_balance()
+        raw_psbl = self.get_buyable_cash_raw("005930", 0)
+
+        withdrawable = bal.get("cash", 0.0)
+        orderable_from_bal = bal.get("orderable_cash", 0.0)
+        ord_psbl_cash = raw_psbl["ord_psbl_cash"]
+        nrcvb_buy_amt = raw_psbl["nrcvb_buy_amt"]
+
+        # 앱 주문가능금액 = max(nrcvb_buy_amt, ord_psbl_cash)
+        orderable = max(nrcvb_buy_amt, ord_psbl_cash)
+        if orderable == 0:
+            orderable = orderable_from_bal
+        settlement_pending = max(0.0, orderable - withdrawable)
+
+        return {
+            "withdrawable_amount": withdrawable,
+            "cash_balance": withdrawable,
+            "orderable_cash": orderable,
+            "ord_psbl_cash": ord_psbl_cash,
+            "nrcvb_buy_amt": nrcvb_buy_amt,
+            "buyable_amount": orderable,
+            "settlement_pending_cash": settlement_pending,
+            "raw_fields": {
+                "dnca_tot_amt": withdrawable,
+                "ord_psbl_cash_from_balance": orderable_from_bal,
+                "ord_psbl_cash_from_psbl_order": ord_psbl_cash,
+                "nrcvb_buy_amt_from_psbl_order": nrcvb_buy_amt,
+                "psbl_order_raw_output": raw_psbl.get("output", {}),
+            },
+        }
+
+    def get_stock_buyable_amount(self, symbol: str = "005930", price: int = 0) -> float:
+        """종목별 매수가능금액 조회 (get_buyable_cash 동일 로직, 명시적 네이밍)."""
+        return self.get_buyable_cash(symbol=symbol, price=price)
 
     # ── 주문 가능 금액 ────────────────────────────────────────────────────
 
-    def get_buyable_cash(self, symbol: str = "005930", price: int = 0) -> float:
+    def get_buyable_cash_raw(
+        self,
+        symbol: str = "005930",
+        price: int = 0,
+        ord_dvsn: str | None = None,
+        cma_incl: str = "Y",
+    ) -> dict:
+        """
+        inquire-psbl-order 전체 raw output 반환.
+        반환: {
+            "output": dict,          # API 응답 output 전체
+            "ord_psbl_cash": float,  # 주문가능현금 (현금성)
+            "nrcvb_buy_amt": float,  # 재매수가능금액 (D+2 매도대금 포함 — 앱 주문가능금액)
+            "psbl_qty": int,         # 주문가능수량
+            "rt_cd": str,
+            "msg_cd": str,
+            "msg1": str,
+            "params_used": dict,
+            "error": str (실패 시),
+        }
+        """
         tr_id = TR_BUYABLE_MOCK if self.mode == "mock" else TR_BUYABLE_REAL
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
         headers = self._auth_headers(tr_id)
-        ord_dvsn = ORD_DVSN_MARKET if price == 0 else ORD_DVSN_LIMIT
+        _ord_dvsn = ord_dvsn if ord_dvsn is not None else (ORD_DVSN_MARKET if price == 0 else ORD_DVSN_LIMIT)
         params = {
             "CANO": self.account_no,
             "ACNT_PRDT_CD": self.product_code,
             "PDNO": symbol,
             "ORD_UNPR": str(price),
-            "ORD_DVSN": ord_dvsn,
-            "CMA_EVLU_AMT_ICLD_YN": "Y",
+            "ORD_DVSN": _ord_dvsn,
+            "CMA_EVLU_AMT_ICLD_YN": cma_incl,
             "OVRS_ICLD_YN": "N",
         }
         try:
             resp = self._session.get(url, headers=headers, params=params, timeout=10)
             resp.raise_for_status()
-            output = resp.json().get("output", {})
-            return float(output.get("ord_psbl_cash", 0))
+            data = resp.json()
+            output = data.get("output", {})
+            return {
+                "output": output,
+                "ord_psbl_cash": float(output.get("ord_psbl_cash", 0) or 0),
+                "nrcvb_buy_amt": float(output.get("nrcvb_buy_amt", 0) or 0),
+                "psbl_qty": int(output.get("psbl_qty", 0) or 0),
+                "rt_cd": data.get("rt_cd", ""),
+                "msg_cd": data.get("msg_cd", ""),
+                "msg1": data.get("msg1", ""),
+                "params_used": params,
+            }
         except Exception as e:
-            logger.warning(f"[KIS-{self.mode.upper()}] 주문가능금액 조회 실패: {e}")
-            return 0.0
+            logger.warning(f"[KIS-{self.mode.upper()}] 주문가능금액 raw 조회 실패: {e}")
+            return {
+                "output": {},
+                "ord_psbl_cash": 0.0,
+                "nrcvb_buy_amt": 0.0,
+                "psbl_qty": 0,
+                "rt_cd": "",
+                "msg_cd": "",
+                "msg1": "",
+                "params_used": params,
+                "error": str(e),
+            }
+
+    def get_buyable_cash(self, symbol: str = "005930", price: int = 0) -> float:
+        """
+        주문가능금액 조회.
+        실계좌(real)에서는 nrcvb_buy_amt(재매수가능금액, D+2 매도대금 포함)를
+        ord_psbl_cash보다 우선 사용한다. 앱 "주문가능금액"과 일치하는 필드.
+        두 값 모두 0이면 0 반환.
+        """
+        raw = self.get_buyable_cash_raw(symbol=symbol, price=price)
+        ord_psbl = raw["ord_psbl_cash"]
+        nrcvb = raw["nrcvb_buy_amt"]
+        # 실계좌: 재매수가능금액(nrcvb_buy_amt)이 앱 주문가능금액과 일치하는 경향
+        # 두 값 중 큰 것을 매수 한도로 사용
+        result = max(nrcvb, ord_psbl)
+        if result != ord_psbl:
+            logger.debug(
+                f"[KIS-{self.mode.upper()}] 주문가능: ord_psbl_cash={ord_psbl:,.0f} "
+                f"nrcvb_buy_amt={nrcvb:,.0f} → {result:,.0f} 사용"
+            )
+        return result
 
     # ── 일별 주가 조회 ────────────────────────────────────────────────────
 

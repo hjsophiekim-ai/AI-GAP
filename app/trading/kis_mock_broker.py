@@ -32,6 +32,7 @@ class KisMockBroker(BrokerBase):
             return None
 
     def get_balance(self) -> float:
+        """예탁금총금액(인출가능금액 근사치) 반환 — 화면 표시용. 매수 판단에 쓰지 말 것."""
         try:
             result = self.kis.get_balance()
             return result.get("cash", 0.0)
@@ -39,12 +40,37 @@ class KisMockBroker(BrokerBase):
             logger.error("MOCK get_balance 예외: %s", e)
             return 0.0
 
-    def get_buyable_cash(self) -> float:
+    def get_orderable_cash(self) -> float:
+        """주문가능현금(ord_psbl_cash) 반환 — 매수 예산 판단에 사용."""
         try:
             return self.kis.get_buyable_cash()
         except Exception as e:
-            logger.error("MOCK get_buyable_cash 예외: %s", e)
+            logger.error("MOCK get_orderable_cash 예외: %s", e)
             return 0.0
+
+    def get_buyable_cash(self) -> float:
+        """하위 호환 — get_orderable_cash() 위임."""
+        return self.get_orderable_cash()
+
+    def get_stock_buyable_amount(self, symbol: str = "005930", price: int = 0) -> float:
+        """종목별 매수가능금액."""
+        try:
+            return self.kis.get_buyable_cash(symbol=symbol, price=price)
+        except Exception as e:
+            logger.error("MOCK get_stock_buyable_amount 예외 %s: %s", symbol, e)
+            return 0.0
+
+    def get_account_cash_breakdown(self) -> dict:
+        """계좌 현금 상세 분리 조회."""
+        try:
+            return self.kis.get_account_cash_breakdown()
+        except Exception as e:
+            logger.error("MOCK get_account_cash_breakdown 예외: %s", e)
+            return {
+                "withdrawable_amount": 0.0, "cash_balance": 0.0,
+                "orderable_cash": 0.0, "buyable_amount": 0.0,
+                "settlement_pending_cash": 0.0, "raw_fields": {}, "error": str(e),
+            }
 
     def get_positions(self) -> list[Position]:
         result = self.kis.get_balance()

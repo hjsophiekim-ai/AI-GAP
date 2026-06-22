@@ -160,7 +160,7 @@ def _show_buy_results(results, log_path=None):
         result_rows.append({
             "종목코드": r.symbol, "종목명": r.name, "수량": r.quantity,
             "가격": format_price(r.price), "주문번호": r.order_id,
-            "결과": label, "메시지": r.message[:60] if not r.success else "",
+            "결과": label, "메시지": (r.message[:80] + "…") if (not r.success and len(r.message) > 80) else (r.message if not r.success else ""),
         })
 
     if result_rows:
@@ -169,6 +169,15 @@ def _show_buy_results(results, log_path=None):
             return [f"background-color:{c}"] * len(row)
         st.dataframe(pd.DataFrame(result_rows).style.apply(_hl, axis=1),
                      use_container_width=True, hide_index=True)
+
+    # 실패 상세 메시지 (전체 출력)
+    failed = [r for r in results if not r.success and not r.excluded_reason
+              and r.error_type not in ("excluded_etf", "duplicate", "validation_error", "batch_aborted")]
+    if failed:
+        with st.expander(f"실패 상세 ({len(failed)}건)", expanded=True):
+            for r in failed:
+                st.markdown(f"**{r.name} ({r.symbol})**")
+                st.code(r.message, language=None)
 
     if log_path:
         try:
@@ -222,6 +231,66 @@ if selected_mode == "real":
         _runtime_real_mode = True
     else:
         st.error("실전모드 미활성화 — 'API 연결' 페이지에서 실전모드 버튼을 먼저 활성화하세요.")
+
+# real 모드: 실계좌 주문가능금액 및 안전한도 표시
+if selected_mode == "real" and st.session_state.get("real_mode_enabled", False):
+    _real_limits = get_config().get_real_order_limits()
+    with st.expander("실계좌 안전한도 설정", expanded=True):
+        lc1, lc2, lc3 = st.columns(3)
+        with lc1:
+            real_max_order = st.number_input(
+                "1회 주문한도 (원)", min_value=100_000, max_value=50_000_000,
+                value=int(_real_limits["per_order"]),
+                step=500_000, format="%d", key="ui_real_max_order",
+                help="REAL_MAX_ORDER_AMOUNT 환경변수로도 설정 가능"
+            )
+        with lc2:
+            real_max_daily = st.number_input(
+                "하루 주문한도 (원)", min_value=1_000_000, max_value=200_000_000,
+                value=int(_real_limits["daily"]),
+                step=1_000_000, format="%d", key="ui_real_max_daily",
+                help="REAL_MAX_DAILY_ORDER_AMOUNT 환경변수로도 설정 가능"
+            )
+        with lc3:
+            real_max_symbol = st.number_input(
+                "종목당 보유한도 (원)", min_value=100_000, max_value=100_000_000,
+                value=int(_real_limits["per_symbol"]),
+                step=500_000, format="%d", key="ui_real_max_symbol",
+                help="REAL_MAX_POSITION_AMOUNT_PER_SYMBOL 환경변수로도 설정 가능"
+            )
+        auto_reduce_on = st.checkbox(
+            "한도 초과 시 수량 자동 조정", value=_real_limits.get("auto_reduce", True),
+            key="ui_auto_reduce",
+            help="활성화하면 한도 초과 시 주문 실패 대신 가능한 수량으로 자동 줄임"
+        )
+        st.session_state["real_order_limits"] = {
+            "per_order": real_max_order,
+            "daily": real_max_daily,
+            "per_symbol": real_max_symbol,
+            "auto_reduce": auto_reduce_on,
+        }
+
+        if st.button("실계좌 주문가능금액 조회", key="btn_fetch_orderable"):
+            try:
+                _b = _safe_create_broker(cfg=get_config(), mode="real",
+                                          confirm_text="",
+                                          runtime_real_mode=True,
+                                          runtime_enable_real_buy=_runtime_enable_real_buy)
+                _oc = _b.get_orderable_cash()
+                st.session_state["real_orderable_cash"] = _oc
+            except Exception as _ex:
+                st.error(f"조회 실패: {_ex}")
+
+        _real_oc = st.session_state.get("real_orderable_cash")
+        if _real_oc is not None:
+            if total_budget > _real_oc:
+                st.warning(
+                    f"설정 예산 {format_amount(total_budget)} > "
+                    f"실계좌 주문가능금액 {format_amount(_real_oc)} — "
+                    "예산을 주문가능금액 이내로 줄이거나 계좌에 자금을 추가하세요."
+                )
+            else:
+                st.success(f"실계좌 주문가능금액: {format_amount(_real_oc)} (예산 내 사용 가능)")
 
 confirm_text = ""
 if selected_mode == "real":

@@ -82,27 +82,93 @@ class KisRealBroker(BrokerBase):
     # 주문 금액 안전장치 (gate 5, 매수 전용)
     # ------------------------------------------------------------------
 
-    def _check_order_limits(self, quantity: int, price: float) -> str | None:
-        """금액 한도 확인. 위반 시 사유 문자열 반환, 통과 시 None."""
-        safety = self._cfg.safety
+    def _get_order_limits(self) -> dict:
+        """실계좌 주문 안전한도 읽기."""
+        return self._cfg.get_real_order_limits()
+
+    def _check_order_limits(
+        self,
+        quantity: int,
+        price: float,
+        symbol: str = "",
+        allocated_budget: float = 0.0,
+    ) -> tuple:
+        """금액 한도 확인. 반환: (error_msg | None, error_type | None)"""
+        limits = self._get_order_limits()
         order_amt = quantity * price
-        # 새 키 우선, 구 키 fallback
-        max_order = float(
-            safety.get("max_order_amount")
-            or safety.get("max_real_order_amount", 1_000_000)
-        )
-        max_daily = float(
-            safety.get("max_daily_order_amount")
-            or safety.get("max_real_daily_budget", 1_000_000)
-        )
-        if order_amt > max_order:
-            return f"주문금액 초과: {order_amt:,.0f}원 > 한도 {max_order:,.0f}원"
-        if self._daily_ordered_amount + order_amt > max_daily:
-            return (
-                f"일일 한도 초과: "
-                f"{self._daily_ordered_amount + order_amt:,.0f}원 > {max_daily:,.0f}원"
+
+        orderable_cash = 0.0
+        try:
+            if symbol:
+                orderable_cash = self.kis.get_buyable_cash(symbol=symbol, price=int(price))
+        except Exception:
+            pass
+
+        if limits["per_symbol"] > 0 and order_amt > limits["per_symbol"]:
+            msg = (
+                f"실계좌 안전한도 초과\n"
+                f"• 주문금액: {order_amt:,.0f}원\n"
+                f"• 종목당 보유한도: {limits['per_symbol']:,.0f}원\n"
+                f"• 계좌 주문가능금액: {orderable_cash:,.0f}원\n"
+                f"• 해결방법: REAL_MAX_POSITION_AMOUNT_PER_SYMBOL 또는 UI 한도를 상향하세요"
             )
-        return None
+            return msg, "safety_symbol_limit_exceeded"
+
+        if order_amt > limits["per_order"]:
+            msg = (
+                f"실계좌 안전한도 초과\n"
+                f"• 주문금액: {order_amt:,.0f}원\n"
+                f"• 1회 주문 안전한도: {limits['per_order']:,.0f}원\n"
+                f"• 종목별 배정예산: {allocated_budget:,.0f}원\n"
+                f"• 계좌 주문가능금액: {orderable_cash:,.0f}원\n"
+                f"• 해결방법: REAL_MAX_ORDER_AMOUNT 또는 UI의 1회 주문한도를 상향하세요"
+            )
+            return msg, "safety_per_order_limit_exceeded"
+
+        if self._daily_ordered_amount + order_amt > limits["daily"]:
+            msg = (
+                f"실계좌 일일한도 초과\n"
+                f"• 오늘 주문누계: {self._daily_ordered_amount:,.0f}원\n"
+                f"• 이번 주문금액: {order_amt:,.0f}원\n"
+                f"• 일일 주문한도: {limits['daily']:,.0f}원\n"
+                f"• 해결방법: REAL_MAX_DAILY_ORDER_AMOUNT를 상향하세요"
+            )
+            return msg, "safety_daily_limit_exceeded"
+
+        return None, None
+
+    def _auto_reduce_quantity(
+        self,
+        quantity: int,
+        price: float,
+        symbol: str = "",
+        allocated_budget: float = 0.0,
+    ) -> tuple:
+        """한도 내로 수량 자동 조정. 반환: (new_quantity, reason_str)"""
+        limits = self._get_order_limits()
+        safe_margin = 0.98
+
+        orderable_cash = 0.0
+        try:
+            if symbol:
+                orderable_cash = self.kis.get_buyable_cash(symbol=symbol, price=int(price))
+        except Exception:
+            pass
+
+        remaining_daily = max(0.0, limits["daily"] - self._daily_ordered_amount)
+        candidates = [limits["per_order"], remaining_daily, limits["per_symbol"]]
+        if orderable_cash > 0:
+            candidates.append(orderable_cash)
+        usable = min(candidates)
+
+        safe_amount = usable * safe_margin
+        new_qty = int(safe_amount / price) if price > 0 else 0
+
+        if new_qty < 1:
+            return 0, "한도 내 주문 불가 (최소 1주 미만)"
+        if new_qty < quantity:
+            return new_qty, f"한도에 맞춰 수량 자동 조정: {quantity}주 → {new_qty}주"
+        return quantity, ""
 
     # ------------------------------------------------------------------
     # BrokerBase interface
@@ -117,6 +183,7 @@ class KisRealBroker(BrokerBase):
             return None
 
     def get_balance(self) -> float:
+        """예탁금총금액(인출가능금액 근사치) 반환 — 화면 표시용. 매수 판단에 쓰지 말 것."""
         try:
             result = self.kis.get_balance()
             return result.get("cash", 0.0)
@@ -124,12 +191,37 @@ class KisRealBroker(BrokerBase):
             logger.error("REAL get_balance 예외: %s", e)
             return 0.0
 
-    def get_buyable_cash(self) -> float:
+    def get_orderable_cash(self) -> float:
+        """주문가능현금(ord_psbl_cash) 반환 — 매수 예산 판단에 사용."""
         try:
             return self.kis.get_buyable_cash()
         except Exception as e:
-            logger.error("REAL get_buyable_cash 예외: %s", e)
+            logger.error("REAL get_orderable_cash 예외: %s", e)
             return 0.0
+
+    def get_buyable_cash(self) -> float:
+        """하위 호환 — get_orderable_cash() 위임."""
+        return self.get_orderable_cash()
+
+    def get_stock_buyable_amount(self, symbol: str = "005930", price: int = 0) -> float:
+        """종목별 매수가능금액 (inquire-psbl-order 기준)."""
+        try:
+            return self.kis.get_buyable_cash(symbol=symbol, price=price)
+        except Exception as e:
+            logger.error("REAL get_stock_buyable_amount 예외 %s: %s", symbol, e)
+            return 0.0
+
+    def get_account_cash_breakdown(self) -> dict:
+        """계좌 현금 상세 분리 조회."""
+        try:
+            return self.kis.get_account_cash_breakdown()
+        except Exception as e:
+            logger.error("REAL get_account_cash_breakdown 예외: %s", e)
+            return {
+                "withdrawable_amount": 0.0, "cash_balance": 0.0,
+                "orderable_cash": 0.0, "buyable_amount": 0.0,
+                "settlement_pending_cash": 0.0, "raw_fields": {}, "error": str(e),
+            }
 
     def get_positions(self) -> list[Position]:
         """잔고 조회. API 오류 시 RuntimeError 발생."""
@@ -175,16 +267,44 @@ class KisRealBroker(BrokerBase):
                 order_id="", message=_REAL_MODE_BLOCKED_MSG,
             )
 
-        # gate 5b: 주문금액 한도
-        limit_msg = self._check_order_limits(quantity, price)
-        if limit_msg:
-            logger.warning("REAL 매수 차단: %s", limit_msg)
-            return OrderResult(
-                success=False, mode=self.mode, account_type="real",
-                symbol=symbol, name=name, side="buy",
-                quantity=quantity, price=price, order_type=order_type,
-                order_id="", message=f"real trading blocked by safety rule: {limit_msg}",
-            )
+        # gate 5b: 주문금액 한도 (auto_reduce 지원)
+        limits = self._get_order_limits()
+        err_msg, err_type = self._check_order_limits(
+            quantity, price, symbol=symbol, allocated_budget=0.0,
+        )
+        if err_msg:
+            if limits.get("auto_reduce", True):
+                new_qty, reduce_reason = self._auto_reduce_quantity(quantity, price, symbol=symbol)
+                if new_qty < 1:
+                    logger.warning("REAL 매수 차단 (자동조정 실패): %s | %s", symbol, err_msg.split('\n')[0])
+                    return OrderResult(
+                        success=False, mode=self.mode, account_type="real",
+                        symbol=symbol, name=name, side="buy",
+                        quantity=quantity, price=price, order_type=order_type,
+                        order_id="", message=err_msg,
+                        error_type=err_type,
+                    )
+                logger.info("REAL 매수 수량 자동조정: %s %d→%d주 (%s)", symbol, quantity, new_qty, reduce_reason)
+                quantity = new_qty
+                err_msg2, err_type2 = self._check_order_limits(quantity, price, symbol=symbol)
+                if err_msg2:
+                    logger.warning("REAL 매수 차단 (조정 후도 초과): %s", symbol)
+                    return OrderResult(
+                        success=False, mode=self.mode, account_type="real",
+                        symbol=symbol, name=name, side="buy",
+                        quantity=quantity, price=price, order_type=order_type,
+                        order_id="", message=err_msg2,
+                        error_type=err_type2,
+                    )
+            else:
+                logger.warning("REAL 매수 차단: %s", err_msg.split('\n')[0])
+                return OrderResult(
+                    success=False, mode=self.mode, account_type="real",
+                    symbol=symbol, name=name, side="buy",
+                    quantity=quantity, price=price, order_type=order_type,
+                    order_id="", message=err_msg,
+                    error_type=err_type,
+                )
 
         logger.info(
             "REAL BUY: symbol=%s name=%s quantity=%d price=%s order_type=%s",

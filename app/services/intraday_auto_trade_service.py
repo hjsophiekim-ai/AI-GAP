@@ -200,9 +200,12 @@ class IntradayAutoTradeService:
         if self.kis_client is None:
             return []
         try:
-            return self.kis_client.get_minute_candles(symbol, period_min=1, count=60)
+            candles = self.kis_client.get_minute_candles(symbol, period_min=1, count=60)
+            if not candles:
+                logger.warning(f"[Intraday] 1분봉 빈 응답 {symbol} (장 마감 또는 API 오류)")
+            return candles or []
         except Exception as e:
-            logger.warning(f"[Intraday] 분봉 조회 실패 {symbol}: {e}")
+            logger.warning(f"[Intraday] 1분봉 조회 실패 {symbol}: {e}")
             return []
 
     def _get_current_price(self, symbol: str, state: dict) -> float:
@@ -239,6 +242,15 @@ class IntradayAutoTradeService:
 
         if len(candles_1m) < 5:
             return False, "insufficient_candle_data"
+
+        # 3분봉 최소 5개 미만이면 지표 계산 불가
+        candles_3m_pre = resample_1m_to_3m(candles_1m)
+        if len(candles_3m_pre) < 5:
+            logger.warning(
+                f"[Intraday] 3분봉 부족 {symbol}: 1분봉={len(candles_1m)}개 "
+                f"→ 3분봉={len(candles_3m_pre)}개 (최소 5개 필요)"
+            )
+            return False, "insufficient_3m_candles"
 
         # 표준 조건 체크
         ok, reason = self._standard_buy_check(symbol, state, candles_1m, current_price)
@@ -583,6 +595,481 @@ class IntradayAutoTradeService:
     @staticmethod
     def _parse_time(time_str: str):
         """'HH:MM' 형식을 datetime.time으로 변환."""
+        from datetime import time as dtime
+        parts = time_str.split(":")
+        return dtime(int(parts[0]), int(parts[1]))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Top3TimedBuyService — top3_timed_buy_3pct_takeprofit 전략
+# 복잡한 1분봉/VWAP/EMA/RSI 조건 없이 시간 기반 순차매수 + +3% 자동익절
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TIMED_LOG_COLUMNS = [
+    "timestamp", "action", "symbol", "name", "rank",
+    "quantity", "price", "order_amount", "profit_rate",
+    "reason", "status", "order_no", "error_message",
+]
+
+_TIMED_STRATEGY_NAME = "top3_timed_buy_3pct_takeprofit"
+
+
+class Top3TimedBuyService:
+    """시간 분산 매수 + 3% 자동익절 전략 서비스."""
+
+    def __init__(self, broker, kis_client=None, cfg=None):
+        from app.config import get_config
+        self._cfg = cfg or get_config()
+        self.broker = broker
+        self.kis_client = kis_client
+
+        ic = self._cfg._raw.get("intraday_auto_trade", {})
+        sched = ic.get("buy_schedule", {})
+        alloc = ic.get("budget_allocation", {})
+
+        self.buy_window_start: str = ic.get("buy_window_start", "09:10")
+        self.buy_window_end: str = ic.get("buy_window_end", "09:30")
+        self.buy_schedule: dict = {
+            1: sched.get("rank1", "09:12"),
+            2: sched.get("rank2", "09:16"),
+            3: sched.get("rank3", "09:20"),
+        }
+        self.budget_alloc: dict = {
+            1: float(alloc.get("rank1", 0.45)),
+            2: float(alloc.get("rank2", 0.35)),
+            3: float(alloc.get("rank3", 0.20)),
+        }
+        self.check_interval_seconds: int = int(ic.get("check_interval_seconds", 10))
+        self.take_profit_pct: float = float(ic.get("take_profit_pct", 3.0))
+        self.stop_loss_pct: float = float(ic.get("stop_loss_pct", -1.2))
+        self.stop_loss_enabled: bool = bool(ic.get("stop_loss_enabled", True))
+        self.force_exit_time: str = ic.get("force_exit_time", "15:10")
+
+        self.min_change_rate_at_buy: float = float(ic.get("min_change_rate_at_buy", -1.0))
+        self.max_drop_from_intraday_high_pct: float = float(ic.get("max_drop_from_intraday_high_pct", 5.0))
+        self.safety_filter_enabled: bool = bool(ic.get("minimum_safety_filter_enabled", True))
+
+        today = datetime.now().strftime("%Y%m%d")
+        self.state_file = _ROOT / f"data/state/{_TIMED_STRATEGY_NAME}_{today}.json"
+        self.log_file = _ROOT / f"data/logs/{_TIMED_STRATEGY_NAME}_{today}.csv"
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        self.total_budget: float = 0.0
+        self.symbols_state: dict[str, dict] = {}
+
+        # 매수/매도 독립 제어 플래그
+        self.enable_auto_buy: bool = True   # False이면 매수 단계 건너뜀
+        self.enable_auto_sell: bool = True  # False이면 매도 단계 건너뜀
+
+        self.load_state()
+
+    # ── Top3 종목 로드 ─────────────────────────────────────────────────────
+
+    def load_from_positions(
+        self,
+        positions: list,
+        take_profit_pct: float = 3.0,
+        stop_loss_pct: float = -1.5,
+    ) -> None:
+        """
+        자동매도 전용 모드: 현재 보유종목(포지션)을 감시 상태로 로드.
+        enable_auto_buy=False일 때 사용. 이미 보유 중인 종목을 HOLDING 상태로 등록해
+        익절/손절 조건 도달 시 자동매도한다.
+
+        Parameters
+        ----------
+        positions : broker.get_positions() 또는 KISClient.get_balance()['positions'] 결과
+        take_profit_pct  : 익절 기준 (%) 예: 3.0
+        stop_loss_pct    : 손절 기준 (%) 예: -1.5
+        """
+        self.take_profit_pct = take_profit_pct
+        self.stop_loss_pct = stop_loss_pct
+
+        for pos in positions:
+            # Position 객체 또는 dict 모두 지원
+            sym = str(getattr(pos, "symbol", None) or pos.get("symbol", "")).strip()
+            name = str(getattr(pos, "name", None) or pos.get("name", sym))
+            qty = int(getattr(pos, "quantity", None) or pos.get("quantity", 0))
+            avg_price = float(getattr(pos, "avg_price", None) or pos.get("avg_price", 0) or 0)
+            cur_price = float(getattr(pos, "current_price", None) or pos.get("current_price", avg_price) or avg_price)
+            if not sym or qty <= 0 or avg_price <= 0:
+                continue
+            if sym in self.symbols_state:
+                continue  # 당일 상태 유지
+            self.symbols_state[sym] = {
+                "date": datetime.now().strftime("%Y%m%d"),
+                "strategy_name": _TIMED_STRATEGY_NAME,
+                "symbol": sym,
+                "name": name,
+                "rank": 0,
+                "allocated_budget": round(avg_price * qty),
+                "buy_scheduled_time": "00:00",
+                "bought_today": True,       # 이미 매수 완료
+                "buy_time": "",
+                "buy_price": avg_price,
+                "buy_quantity": qty,
+                "avg_buy_price": avg_price,
+                "current_price": cur_price,
+                "profit_rate": round((cur_price - avg_price) / avg_price * 100.0, 4) if avg_price > 0 else 0.0,
+                "take_profit_pct": take_profit_pct,
+                "stop_loss_pct": stop_loss_pct,
+                "sold_today": False,
+                "sell_time": "",
+                "sell_price": 0.0,
+                "sell_reason": "",
+                "order_no": "",
+                "status": "HOLDING",
+                "last_checked_at": "",
+                "last_error": "",
+            }
+        logger.info(
+            f"[TimedBuy] 자동매도 전용: {len(self.symbols_state)}종목 HOLDING 등록 "
+            f"(익절 +{take_profit_pct:.1f}% / 손절 {stop_loss_pct:.1f}%)"
+        )
+        self.save_state()
+
+    def load_top3(self, top3: list[dict], total_budget: float) -> None:
+        self.total_budget = total_budget
+        for stock in top3:
+            rank = int(stock.get("rank", 0))
+            sym = str(stock.get("symbol", "")).strip()
+            if not sym or rank not in (1, 2, 3):
+                continue
+            if sym in self.symbols_state:
+                continue  # 당일 상태 유지
+            weight = self.budget_alloc.get(rank, 0.2)
+            self.symbols_state[sym] = {
+                "date": datetime.now().strftime("%Y%m%d"),
+                "strategy_name": _TIMED_STRATEGY_NAME,
+                "symbol": sym,
+                "name": stock.get("name", ""),
+                "rank": rank,
+                "allocated_budget": round(total_budget * weight),
+                "buy_scheduled_time": self.buy_schedule.get(rank, "09:20"),
+                "bought_today": False,
+                "buy_time": "",
+                "buy_price": 0.0,
+                "buy_quantity": 0,
+                "avg_buy_price": 0.0,
+                "current_price": float(stock.get("current_price", 0) or 0),
+                "profit_rate": 0.0,
+                "take_profit_pct": self.take_profit_pct,
+                "stop_loss_pct": self.stop_loss_pct,
+                "sold_today": False,
+                "sell_time": "",
+                "sell_price": 0.0,
+                "sell_reason": "",
+                "order_no": "",
+                "status": "WAITING",
+                "last_checked_at": "",
+                "last_error": "",
+            }
+        self._handle_extra_budget()
+        self.save_state()
+
+    def _handle_extra_budget(self) -> None:
+        """배분 후 잔여 예산을 rank1에 추가 (1주 이상 매수 가능 시)."""
+        total_alloc = sum(s["allocated_budget"] for s in self.symbols_state.values())
+        leftover = self.total_budget - total_alloc
+        rank1 = next((s for s in self.symbols_state.values() if s["rank"] == 1), None)
+        if rank1 and leftover > 0:
+            rank1["allocated_budget"] += leftover
+
+    # ── 메인 루프 ──────────────────────────────────────────────────────────
+
+    def run_once(self) -> dict:
+        now = datetime.now()
+        summary = {"checked_at": now.strftime("%Y-%m-%d %H:%M:%S"), "actions": [], "symbols": {}}
+
+        force_time = self._parse_time(self.force_exit_time)
+        is_force_exit = now.time() >= force_time
+
+        for sym, state in self.symbols_state.items():
+            state["last_checked_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+
+            current_price = self._get_current_price(sym, state)
+            if current_price > 0:
+                state["current_price"] = current_price
+                if state["bought_today"] and state["avg_buy_price"] > 0:
+                    state["profit_rate"] = round(
+                        (current_price - state["avg_buy_price"]) / state["avg_buy_price"] * 100.0, 4
+                    )
+
+            # 강제청산: enable_auto_sell=True인 경우에만 실행
+            if is_force_exit and self.enable_auto_sell and state["bought_today"] and not state["sold_today"]:
+                result = self._execute_sell(sym, state, current_price, "force_exit")
+                summary["actions"].append({"symbol": sym, "action": "force_sell", **result})
+
+            # 자동매수: enable_auto_buy=True이고 아직 미매수인 경우
+            elif not state["bought_today"] and self.enable_auto_buy:
+                sched_time = self._parse_time(state["buy_scheduled_time"])
+                buy_end = self._parse_time(self.buy_window_end)
+                if now.time() >= sched_time and now.time() < buy_end:
+                    ok, skip_reason = self._safety_check(sym, state, current_price)
+                    if ok:
+                        result = self._execute_buy(sym, state, current_price)
+                        summary["actions"].append({"symbol": sym, "action": "buy", **result})
+                    else:
+                        state["last_error"] = f"safety_skip: {skip_reason}"
+
+            # 자동매도: enable_auto_sell=True이고 보유 중인 경우
+            elif state["bought_today"] and not state["sold_today"] and self.enable_auto_sell:
+                profit_rate = state.get("profit_rate", 0.0)
+                sell_reason = ""
+                if profit_rate >= self.take_profit_pct:
+                    sell_reason = "take_profit"
+                elif self.stop_loss_enabled and profit_rate <= self.stop_loss_pct:
+                    sell_reason = "stop_loss"
+                if sell_reason:
+                    result = self._execute_sell(sym, state, current_price, sell_reason)
+                    summary["actions"].append({"symbol": sym, "action": "sell", **result})
+
+            summary["symbols"][sym] = state.get("status", "UNKNOWN")
+
+        self.save_state()
+        return summary
+
+    # ── 안전조건 검사 ──────────────────────────────────────────────────────
+
+    def _safety_check(self, symbol: str, state: dict, current_price: float) -> tuple[bool, str]:
+        if not self.safety_filter_enabled:
+            return True, ""
+        if current_price <= 0:
+            return False, "no_price"
+        budget = state.get("allocated_budget", 0)
+        if budget <= 0 or current_price <= 0 or int(budget / current_price) < 1:
+            return False, "qty_zero"
+
+        if self.kis_client:
+            try:
+                data = self.kis_client.get_current_price(symbol)
+                if data:
+                    prev_close = float(data.get("prev_close_price", 0) or 0)
+                    intraday_high = float(data.get("high_price", current_price) or current_price)
+                    if prev_close > 0:
+                        change_rate = (current_price - prev_close) / prev_close * 100.0
+                        if change_rate < self.min_change_rate_at_buy:
+                            return False, f"change_rate_too_low({change_rate:.2f}%)"
+                    if intraday_high > 0:
+                        drop_from_high = (current_price - intraday_high) / intraday_high * 100.0
+                        if drop_from_high < -abs(self.max_drop_from_intraday_high_pct):
+                            return False, f"drop_from_high_too_large({drop_from_high:.2f}%)"
+            except Exception:
+                pass  # 조회 실패 시 안전조건 통과 (skip하지 않음)
+        return True, ""
+
+    # ── 현재가 조회 ────────────────────────────────────────────────────────
+
+    def _get_current_price(self, symbol: str, state: dict) -> float:
+        if self.kis_client is None:
+            return state.get("current_price", 0.0)
+        try:
+            data = self.kis_client.get_current_price(symbol)
+            if data:
+                return float(data.get("current_price", 0) or 0)
+        except Exception:
+            pass
+        return state.get("current_price", 0.0)
+
+    # ── 매수 실행 ──────────────────────────────────────────────────────────
+
+    def _execute_buy(self, symbol: str, state: dict, current_price: float) -> dict:
+        if current_price <= 0:
+            state["last_error"] = "no_price"
+            return {"success": False, "reason": "no_price"}
+
+        broker_mode = getattr(self.broker, "mode", "mock")
+        if broker_mode == "real":
+            safety = self._cfg._raw.get("safety", {})
+            if not safety.get("enable_real_trading", False) or not safety.get("enable_real_buy", False):
+                state["last_error"] = "real_buy_disabled"
+                return {"success": False, "reason": "real_buy_disabled"}
+
+        # 실계좌: 종목별 매수가능금액(nrcvb_buy_amt 포함) vs 배분예산 중 작은 값 사용
+        # 우선순위: 1) get_stock_buyable_amount(symbol)  2) get_orderable_cash()  3) allocated
+        # 절대 get_balance()(=인출가능금액 withdrawable)를 매수 기준으로 쓰지 않는다.
+        allocated = state.get("allocated_budget", 0)
+        if broker_mode == "real":
+            try:
+                if hasattr(self.broker, "get_stock_buyable_amount"):
+                    buyable = self.broker.get_stock_buyable_amount(symbol, int(current_price))
+                elif hasattr(self.broker, "get_orderable_cash"):
+                    buyable = self.broker.get_orderable_cash()
+                else:
+                    buyable = allocated
+                safe_budget = min(allocated, math.floor(buyable * 0.98))
+            except Exception:
+                safe_budget = allocated
+        else:
+            safe_budget = allocated
+
+        quantity = int(safe_budget / current_price)
+        if quantity < 1:
+            state["last_error"] = "qty_too_small"
+            return {"success": False, "reason": "qty_too_small"}
+
+        def _do_buy(qty):
+            result = self.broker.buy(symbol, qty, int(current_price))
+            ok = result.get("success", False) if isinstance(result, dict) else bool(result)
+            ono = result.get("order_id", result.get("order_no", "")) if isinstance(result, dict) else ""
+            msg = result.get("message", "") if isinstance(result, dict) else ""
+            return ok, ono, msg
+
+        try:
+            success, order_no, msg = _do_buy(quantity)
+            # 잔고 부족 오류 시: 최신 매수가능금액 재조회 후 0.95배 수량 1회 재시도
+            if not success and broker_mode == "real" and "잔고부족" in msg:
+                try:
+                    if hasattr(self.broker, "get_stock_buyable_amount"):
+                        refreshed = self.broker.get_stock_buyable_amount(symbol, int(current_price))
+                        # 재조회 금액의 95% vs 배분예산 중 작은 값으로 재계산
+                        retry_qty = int(math.floor(min(allocated, refreshed) * 0.95 / current_price))
+                    else:
+                        retry_qty = int(quantity * 0.95)
+                except Exception:
+                    retry_qty = int(quantity * 0.95)
+                if retry_qty >= 1:
+                    logger.warning(f"[TimedBuy] 잔고부족 재시도 {symbol} {quantity}→{retry_qty}주")
+                    success, order_no, msg = _do_buy(retry_qty)
+                    if success:
+                        quantity = retry_qty
+                    else:
+                        logger.error(
+                            f"[TimedBuy] 재시도도 실패 {symbol}: msg_cd/msg1 확인 필요 | msg={msg}"
+                        )
+        except Exception as e:
+            logger.error(f"[TimedBuy] 매수 예외 {symbol}: {e}")
+            state["last_error"] = str(e)
+            state["status"] = "ERROR"
+            return {"success": False, "reason": str(e)}
+
+        if success:
+            state["bought_today"] = True
+            state["buy_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            state["buy_price"] = current_price
+            state["buy_quantity"] = quantity
+            state["avg_buy_price"] = current_price
+            state["order_no"] = order_no
+            state["status"] = "HOLDING"
+            state["last_error"] = ""
+            logger.info(f"[TimedBuy] 매수 성공 {symbol}({state['name']}) rank{state['rank']} {quantity}주 @{current_price:,}")
+        else:
+            state["last_error"] = "buy_failed"
+            state["status"] = "BUY_FAILED"
+
+        self._log_trade("buy", state, quantity, current_price, "", order_no, "")
+        return {"success": success, "order_no": order_no, "quantity": quantity, "price": current_price}
+
+    # ── 매도 실행 ──────────────────────────────────────────────────────────
+
+    def _execute_sell(self, symbol: str, state: dict, current_price: float, reason: str) -> dict:
+        quantity = state.get("buy_quantity", 0)
+        if quantity < 1:
+            return {"success": False, "reason": "no_position"}
+
+        if current_price <= 0:
+            current_price = state.get("avg_buy_price", 1.0)
+
+        broker_mode = getattr(self.broker, "mode", "mock")
+        if broker_mode == "real":
+            safety = self._cfg._raw.get("safety", {})
+            if not safety.get("enable_real_trading", False) or not safety.get("enable_real_sell", False):
+                state["last_error"] = "real_sell_disabled"
+                return {"success": False, "reason": "real_sell_disabled"}
+
+        try:
+            result = self.broker.sell(symbol, quantity, int(current_price))
+            success = result.get("success", False) if isinstance(result, dict) else bool(result)
+            order_no = result.get("order_id", result.get("order_no", "")) if isinstance(result, dict) else ""
+        except Exception as e:
+            logger.error(f"[TimedBuy] 매도 예외 {symbol}: {e}")
+            state["last_error"] = str(e)
+            return {"success": False, "reason": str(e)}
+
+        if success:
+            profit_rate = state.get("profit_rate", 0.0)
+            state["sold_today"] = True
+            state["sell_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            state["sell_price"] = current_price
+            state["sell_reason"] = reason
+            state["status"] = "SOLD"
+            state["last_error"] = ""
+            logger.info(f"[TimedBuy] 매도 성공 {symbol} {quantity}주 @{current_price:,} [{reason}] {profit_rate:+.2f}%")
+        else:
+            state["last_error"] = "sell_failed"
+
+        self._log_trade("sell", state, quantity, current_price, reason, order_no, "")
+        return {"success": success, "order_no": order_no, "quantity": quantity, "price": current_price, "reason": reason}
+
+    # ── 상태 저장/복원 ─────────────────────────────────────────────────────
+
+    def save_state(self) -> None:
+        data = {
+            "date": datetime.now().strftime("%Y%m%d"),
+            "strategy_name": _TIMED_STRATEGY_NAME,
+            "total_budget": self.total_budget,
+            "symbols": self.symbols_state,
+        }
+        try:
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"[TimedBuy] 상태 저장 실패: {e}")
+
+    def load_state(self) -> None:
+        if not self.state_file.exists():
+            return
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            today = datetime.now().strftime("%Y%m%d")
+            if data.get("date") != today:
+                return
+            self.total_budget = float(data.get("total_budget", 0))
+            self.symbols_state = data.get("symbols", {})
+            logger.info(f"[TimedBuy] 상태 복원: {len(self.symbols_state)}종목")
+        except Exception as e:
+            logger.warning(f"[TimedBuy] 상태 로드 실패: {e}")
+
+    # ── 상태 조회 헬퍼 ─────────────────────────────────────────────────────
+
+    def get_status_list(self) -> list[dict]:
+        return list(self.symbols_state.values())
+
+    # ── 거래 로그 ──────────────────────────────────────────────────────────
+
+    def _log_trade(self, action: str, state: dict, qty: int, price: float, reason: str, order_no: str, error: str) -> None:
+        avg_buy = state.get("avg_buy_price", 0.0)
+        profit_rate = state.get("profit_rate", 0.0)
+        try:
+            write_header = not self.log_file.exists()
+            with open(self.log_file, "a", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=_TIMED_LOG_COLUMNS)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "action": action,
+                    "symbol": state.get("symbol", ""),
+                    "name": state.get("name", ""),
+                    "rank": state.get("rank", ""),
+                    "quantity": qty,
+                    "price": price,
+                    "order_amount": qty * price,
+                    "profit_rate": profit_rate,
+                    "reason": reason,
+                    "status": state.get("status", ""),
+                    "order_no": order_no,
+                    "error_message": error,
+                })
+        except Exception as e:
+            logger.warning(f"[TimedBuy] 로그 기록 실패: {e}")
+
+    # ── 유틸 ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_time(time_str: str):
         from datetime import time as dtime
         parts = time_str.split(":")
         return dtime(int(parts[0]), int(parts[1]))
