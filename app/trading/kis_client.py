@@ -351,8 +351,28 @@ class KISClient:
         }
         try:
             resp = self._session.get(url, headers=headers, params=params, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
+            # raise_for_status() 전에 본문 파싱 — KIS 500/4xx 응답에도 rt_cd/msg_cd가 들어 있음
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            if not resp.ok:
+                rt_cd = data.get("rt_cd", "")
+                msg_cd = data.get("msg_cd", "")
+                msg1 = data.get("msg1", data.get("error_description", ""))
+                logger.error(
+                    f"[KIS-{self.mode.upper()}] 잔고 조회 HTTP {resp.status_code}: "
+                    f"rt_cd={rt_cd!r} msg_cd={msg_cd!r} msg1={msg1!r} "
+                    f"url={resp.url}"
+                )
+                detail = f"HTTP {resp.status_code}"
+                if msg_cd:
+                    detail += f" msg_cd={msg_cd}"
+                if msg1:
+                    detail += f": {msg1}"
+                elif not msg_cd:
+                    detail += f" (응답 본문 없음)"
+                return {"cash": 0.0, "orderable_cash": 0.0, "positions": [], "error": detail}
 
             rt_cd = data.get("rt_cd", "")
             if rt_cd != "0":
@@ -480,8 +500,34 @@ class KISClient:
         }
         try:
             resp = self._session.get(url, headers=headers, params=params, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            if not resp.ok:
+                rt_cd = data.get("rt_cd", "")
+                msg_cd = data.get("msg_cd", "")
+                msg1 = data.get("msg1", data.get("error_description", ""))
+                logger.warning(
+                    f"[KIS-{self.mode.upper()}] 주문가능금액 HTTP {resp.status_code}: "
+                    f"rt_cd={rt_cd!r} msg_cd={msg_cd!r} msg1={msg1!r}"
+                )
+                detail = f"HTTP {resp.status_code}"
+                if msg_cd:
+                    detail += f" msg_cd={msg_cd}"
+                if msg1:
+                    detail += f": {msg1}"
+                return {
+                    "output": {},
+                    "ord_psbl_cash": 0.0,
+                    "nrcvb_buy_amt": 0.0,
+                    "psbl_qty": 0,
+                    "rt_cd": rt_cd,
+                    "msg_cd": msg_cd,
+                    "msg1": msg1,
+                    "params_used": params,
+                    "error": detail,
+                }
             output = data.get("output", {})
             return {
                 "output": output,

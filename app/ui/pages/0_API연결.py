@@ -157,7 +157,17 @@ def _run_test(mode: str, test_name: str) -> None:
                 else:
                     err = balance.get("error", "")
                     st.error(f"잔고 조회 실패: {err}")
-                    if "40310000" in err or "계좌" in err:
+                    if "HTTP 500" in err or "500" in err:
+                        st.warning(
+                            "**KIS 모의투자 서버 500 오류 주요 원인:**\n\n"
+                            "1. **장 외 시간** — KIS VTS 잔고 조회는 09:00-16:00 KST 범위에서만 정상 작동합니다.\n"
+                            "2. **모의투자 권한 미등록** — KIS 개발자 포털에서 해당 App Key가 "
+                            "`모의투자(VTS)`용으로 별도 등록되어 있어야 합니다. "
+                            "실전 App Key로는 VTS 잔고 조회가 500을 반환할 수 있습니다.\n"
+                            "3. **토큰 세션 불일치** — 토큰을 재발급 후 다시 시도해 보세요.\n\n"
+                            "KIS 개발자 포털 → '모의투자' 탭에서 App Key 등록 여부를 확인하세요."
+                        )
+                    elif "40310000" in err or "계좌" in err:
                         st.info("계좌번호를 확인하세요. KIS API는 CANO=8자리 숫자만 허용합니다. "
                                 "예: 12345678 (하이픈/상품코드 제외)")
             except Exception as exc:
