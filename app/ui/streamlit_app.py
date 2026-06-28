@@ -103,6 +103,7 @@ with st.sidebar:
     st.page_link("pages/3_예산배분_및_매수.py",     label="예산배분·매수", icon="💰")
     st.page_link("pages/4_보유종목_및_일괄매도.py", label="보유·매도",     icon="📤")
     st.page_link("pages/5_자동매도.py",             label="자동매도",      icon="🤖")
+    st.page_link("pages/8_SK하이닉스_예측.py",      label="SK하이닉스 예측", icon="🔮")
 
     st.divider()
 
