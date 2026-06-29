@@ -63,9 +63,11 @@ def _check_minimum_conditions(auto_feat: dict) -> tuple[bool, str]:
     pf = auto_feat.get("predictor_kwargs", {})
     mf = auto_feat.get("micron_features", {})
 
-    # 조건 1: 하이닉스 전일 종가
-    if not pf.get("hynix_prev_close"):
-        return False, "SK하이닉스 전일 종가 없음 — 예측 불가"
+    # 조건 1: 하이닉스 전일 종가 OR 현재가 (한 가지 이상 필수)
+    prev_close    = pf.get("hynix_prev_close")
+    current_price = pf.get("hynix_current_price")
+    if not prev_close and not current_price:
+        return False, "SK하이닉스 전일 종가 및 현재가 모두 없음 — 예측 불가"
 
     # 조건 2: MU 또는 코스피랩
     has_mu       = mf.get("micron_session_strength_score") is not None

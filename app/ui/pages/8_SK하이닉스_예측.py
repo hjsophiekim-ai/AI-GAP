@@ -235,6 +235,30 @@ if auto_run:
         # ── 데이터 진단 (상단 고정 섹션) ────────────────────────────────────
         st.subheader("데이터 진단")
         diag = engine_result.get("diagnostics", {})
+        hynix_data = market_data.get("hynix", {})
+        index_data = market_data.get("index", {})
+
+        _SOURCE_ICON = {
+            "KIS": "🏦",
+            "kis": "🏦",
+            "naver": "📰",
+            "naver_global": "📰",
+            "yfinance": "📊",
+            "cache": "💾",
+        }
+
+        def _src_label(src: str | None) -> str:
+            if not src:
+                return "—"
+            icon = _SOURCE_ICON.get(src, "")
+            label_map = {
+                "KIS": "KIS 성공", "kis": "KIS 성공",
+                "naver": "네이버 성공", "naver_global": "네이버 성공",
+                "yfinance": "yfinance 성공",
+                "cache": "캐시 사용",
+            }
+            return f"{icon} {label_map.get(src, src)}"
+
         _diag_sources = [
             ("MU 현재가",      diag.get("mu", {})),
             ("NVDA 현재가",    diag.get("nvda", {})),
@@ -246,15 +270,31 @@ if auto_run:
         ]
         diag_cols = st.columns(len(_diag_sources))
         for col, (name, src_info) in zip(diag_cols, _diag_sources):
-            ok = src_info.get("ok", False)
+            ok   = src_info.get("ok", False)
             icon = "✅" if ok else "❌"
             src  = src_info.get("source") or src_info.get("status") or "—"
             err  = src_info.get("error") or ""
             with col:
                 st.markdown(f"**{icon} {name}**")
-                st.caption(src)
+                st.caption(_src_label(src))
                 if not ok and err:
                     st.caption(f"⚠ {str(err)[:50]}")
+
+        # 하이닉스 일봉 fallback 경로 상세
+        hynix_chain = hynix_data.get("fallback_chain", [])
+        if hynix_chain:
+            with st.expander("하이닉스 일봉 수집 경로"):
+                for step in hynix_chain:
+                    color = "green" if "성공" in step else "red"
+                    st.markdown(f":{color}[{step}]")
+
+        # 지수 개별 수집 상태
+        idx_detail = index_data.get("fallback_detail", {})
+        if idx_detail:
+            with st.expander("지수/ETF 수집 상세"):
+                for sym, status in idx_detail.items():
+                    color = "green" if status == "성공" else "red"
+                    st.markdown(f"- **{sym}**: :{color}[{status}]")
 
         # 수집 오류 상세
         all_errors = engine_result.get("errors", []) + market_data.get("errors", [])

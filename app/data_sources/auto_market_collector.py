@@ -13,6 +13,7 @@ API 키, 계좌번호, secret은 .env에서만 읽습니다.
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,7 +22,45 @@ from typing import Optional
 import pandas as pd
 from dotenv import load_dotenv
 
+logger = logging.getLogger(__name__)
+
 load_dotenv()
+
+try:
+    from app.data.safe_api import safe_json as _safe_json
+    _SAFE_API_OK = True
+except ImportError:
+    _SAFE_API_OK = False
+
+    def _safe_json(response):  # type: ignore[misc]
+        try:
+            return response.json() if response else None
+        except Exception:
+            return None
+
+try:
+    from app.data.naver_stock_collector import (
+        fetch_naver_daily_ohlcv as _naver_daily_ohlcv,
+        fetch_naver_current_price as _naver_current_price,
+    )
+    _NAVER_COLLECTOR_OK = True
+except ImportError:
+    _NAVER_COLLECTOR_OK = False
+
+    def _naver_daily_ohlcv(code="000660", pages=3):  # type: ignore[misc]
+        return None
+
+    def _naver_current_price(code="000660"):  # type: ignore[misc]
+        return {"current_price": None, "status": "failed"}
+
+try:
+    from app.data.naver_global_stock_collector import fetch_naver_global_quote as _naver_global_quote
+    _NAVER_GLOBAL_OK = True
+except ImportError:
+    _NAVER_GLOBAL_OK = False
+
+    def _naver_global_quote(symbol):  # type: ignore[misc]
+        return {"price": None, "return_pct": None, "source": "failed", "status": "failed"}
 
 try:
     from app.data.market_data_validator import validate_hynix_dataframe
@@ -112,6 +151,18 @@ def collect_mu_data(mode: Optional[str] = None) -> dict:
     except Exception as e:
         result["error"] = (result.get("error") or "") + f" | yfinance MU 실패: {e}"
 
+    # 3순위: Naver 글로벌 (현재가만)
+    try:
+        naver_mu = _naver_global_quote("MU")
+        if naver_mu.get("status") == "success" and naver_mu.get("price"):
+            cp = naver_mu["price"]
+            result.update(
+                current_price={"price": cp, "open": None, "high": None, "low": None},
+                source="naver_global",
+            )
+    except Exception:
+        pass
+
     return result
 
 
@@ -150,7 +201,9 @@ def collect_nvda_data(mode: Optional[str] = None) -> dict:
             }
             params = {"AUTH": "", "EXCD": "NAS", "SYMB": "NVDA"}
             resp = rq.get(f"{base_url}/uapi/overseas-stock/v1/quotations/price", headers=headers, params=params, timeout=10)
-            body = resp.json()
+            body = _safe_json(resp)
+            if body is None:
+                raise ValueError("NVDA KIS 응답이 JSON이 아님 (HTML 또는 빈 응답)")
             out = body.get("output", {})
             price_str = out.get("last") or out.get("zdiv")
             if price_str:
@@ -178,42 +231,58 @@ def collect_nvda_data(mode: Optional[str] = None) -> dict:
 
 def collect_index_data() -> dict:
     """
-    QQQ, SOXX/^SOX, USD/KRW 수집.
+    QQQ, SOXX(^SOX fallback), USD/KRW 수집 (yfinance 개별 다운로드).
 
     Returns
     -------
     dict with keys:
-        qqq_return, sox_return, usdkrw_change, source, error
+        qqq_return, sox_return, usdkrw_change, source, error, fallback_detail
     """
-    result = {"qqq_return": None, "sox_return": None, "usdkrw_change": None, "source": None, "error": None}
-    try:
-        import yfinance as yf
-        tickers = yf.download(
-            tickers=["QQQ", "SOXX", "USDKRW=X"],
-            period="5d",
-            interval="1d",
-            progress=False,
-            auto_adjust=True,
-        )
+    result: dict = {
+        "qqq_return": None,
+        "sox_return": None,
+        "usdkrw_change": None,
+        "source": None,
+        "error": None,
+        "fallback_detail": {},
+    }
 
-        def _pct(ticker: str) -> Optional[float]:
-            try:
-                if isinstance(tickers.columns, pd.MultiIndex):
-                    closes = tickers["Close"][ticker].dropna()
-                else:
-                    closes = tickers["Close"].dropna()
-                if len(closes) >= 2:
-                    return round((closes.iloc[-1] / closes.iloc[-2] - 1) * 100, 2)
-            except Exception:
-                pass
+    def _pct(sym: str) -> Optional[float]:
+        """yfinance 개별 티커 등락률."""
+        try:
+            import yfinance as yf
+            t = yf.Ticker(sym)
+            hist = t.history(period="5d", interval="1d", auto_adjust=True)
+            if hist.empty:
+                return None
+            closes = hist["Close"].dropna()
+            if len(closes) < 2:
+                return None
+            return round(float(closes.iloc[-1] / closes.iloc[-2] - 1) * 100, 2)
+        except Exception as exc:
+            logger.debug("yfinance %s 실패: %s", sym, exc)
             return None
 
-        result["qqq_return"]     = _pct("QQQ")
-        result["sox_return"]     = _pct("SOXX")
-        result["usdkrw_change"]  = _pct("USDKRW=X")
-        result["source"]         = "yfinance"
-    except Exception as e:
-        result["error"] = f"지수/ETF yfinance 실패: {e}"
+    qqq    = _pct("QQQ")
+    sox    = _pct("SOXX")
+    if sox is None:
+        sox = _pct("^SOX")
+    usdkrw = _pct("USDKRW=X")
+
+    result["qqq_return"]    = qqq
+    result["sox_return"]    = sox
+    result["usdkrw_change"] = usdkrw
+    result["fallback_detail"] = {
+        "QQQ":    "성공" if qqq    is not None else "실패",
+        "SOXX":   "성공" if sox    is not None else "실패",
+        "USDKRW": "성공" if usdkrw is not None else "실패",
+    }
+
+    n_ok = sum(1 for v in [qqq, sox, usdkrw] if v is not None)
+    if n_ok > 0:
+        result["source"] = "yfinance"
+    else:
+        result["error"] = "QQQ/SOXX/USD·KRW 모두 수집 실패"
 
     return result
 
@@ -224,65 +293,97 @@ def collect_hynix_daily(mode: Optional[str] = None, n_days: int = 70) -> dict:
     """
     SK하이닉스(000660) 일봉 수집 및 저장.
 
+    수집 우선순위: KIS → Naver 금융 → yfinance → 캐시 (24시간 이내만)
+
     Returns
     -------
     dict with keys:
-        df_daily, prev_close, source, error
+        df_daily, prev_close, current_price, source, error, fallback_chain
     """
+    import time as _time
+
     mode = mode or _kis_mode()
-    result = {"df_daily": None, "prev_close": None, "source": None, "error": None}
+    result: dict = {
+        "df_daily": None,
+        "prev_close": None,
+        "current_price": None,
+        "source": None,
+        "error": None,
+        "fallback_chain": [],
+    }
+
+    def _accept(df, src: str) -> bool:
+        """검증 통과 시 result 업데이트 후 True."""
+        valid, msg, df_ok = validate_hynix_dataframe(df)
+        if valid:
+            _save_hynix_daily(df_ok)
+            last_close = float(df_ok.iloc[-1]["close"])
+            result.update(
+                df_daily=df_ok,
+                prev_close=last_close,
+                current_price=last_close,
+                source=src,
+            )
+            result["fallback_chain"].append(f"{src}: 성공")
+            return True
+        result["fallback_chain"].append(f"{src}: 검증 실패 ({msg})")
+        return False
 
     # 1순위: KIS 국내주식 일봉
     if mode:
         try:
             df_kis = _fetch_hynix_daily_from_kis(mode, n_days)
             if df_kis is not None and not df_kis.empty:
-                valid, msg, df_kis = validate_hynix_dataframe(df_kis)
-                if valid:
-                    _save_hynix_daily(df_kis)
-                    result.update(
-                        df_daily=df_kis,
-                        prev_close=float(df_kis.iloc[-1]["close"]),
-                        source="kis",
-                    )
+                if _accept(df_kis, "KIS"):
                     return result
-                else:
-                    result["error"] = f"KIS 하이닉스 일봉 검증 실패: {msg}"
-        except Exception as e:
-            result["error"] = f"KIS 하이닉스 일봉 실패: {e}"
+        except Exception as exc:
+            result["fallback_chain"].append(f"KIS: 실패 ({exc})")
+            result["error"] = f"KIS 하이닉스 일봉 실패: {exc}"
+    else:
+        result["fallback_chain"].append("KIS: 건너뜀 (인증 키 없음)")
 
-    # 2순위: yfinance
+    # 2순위: Naver 금융 일별시세
+    try:
+        df_naver = _naver_daily_ohlcv("000660", pages=4)
+        if df_naver is not None and not df_naver.empty:
+            if _accept(df_naver, "naver"):
+                return result
+    except Exception as exc:
+        result["fallback_chain"].append(f"Naver: 실패 ({exc})")
+        result["error"] = (result.get("error") or "") + f" | Naver 일봉 실패: {exc}"
+
+    # 3순위: yfinance 000660.KS
     try:
         import yfinance as yf
         ticker = yf.Ticker("000660.KS")
         hist = ticker.history(period=f"{n_days + 30}d", interval="1d", auto_adjust=True)
         if not hist.empty:
             df = _normalize_yf_ohlcv(hist)
-            valid, msg, df = validate_hynix_dataframe(df)
-            if valid:
-                _save_hynix_daily(df)
-                result.update(df_daily=df, prev_close=float(df.iloc[-1]["close"]), source="yfinance")
+            if _accept(df, "yfinance"):
                 return result
-            else:
-                result["error"] = (result.get("error") or "") + f" | yfinance 하이닉스 검증 실패: {msg}"
         else:
-            result["error"] = (result.get("error") or "") + " | yfinance 하이닉스 빈 응답"
-    except Exception as e:
-        result["error"] = (result.get("error") or "") + f" | yfinance 하이닉스 실패: {e}"
+            result["fallback_chain"].append("yfinance: 빈 응답")
+    except Exception as exc:
+        result["fallback_chain"].append(f"yfinance: 실패 ({exc})")
+        result["error"] = (result.get("error") or "") + f" | yfinance 하이닉스 실패: {exc}"
 
-    # 3순위: 캐시된 CSV
+    # 4순위: 캐시 CSV (24시간 이내만)
     if _HYNIX_DAILY_CSV.exists():
         try:
-            df = pd.read_csv(_HYNIX_DAILY_CSV)
-            if "close" in df.columns and not df.empty:
-                valid, msg, df = validate_hynix_dataframe(df)
-                if valid:
-                    result.update(df_daily=df, prev_close=float(df.iloc[-1]["close"]), source="cache")
-                    result["error"] = (result.get("error") or "") + " | 캐시 사용"
-                else:
-                    result["error"] = (result.get("error") or "") + f" | 캐시 검증 실패: {msg}"
-        except Exception as ce:
-            result["error"] = (result.get("error") or "") + f" | 캐시 로드 실패: {ce}"
+            mtime = _HYNIX_DAILY_CSV.stat().st_mtime
+            age_hours = (_time.time() - mtime) / 3600
+            if age_hours > 24:
+                result["fallback_chain"].append(f"캐시: 오래됨 ({age_hours:.1f}시간)")
+                result["error"] = (result.get("error") or "") + " | 캐시 24시간 초과 — 예측 불가"
+            else:
+                df = pd.read_csv(_HYNIX_DAILY_CSV)
+                if "close" in df.columns and not df.empty:
+                    if _accept(df, "cache"):
+                        result["error"] = (result.get("error") or "") + f" | 캐시 사용 ({age_hours:.1f}시간 전)"
+                        return result
+        except Exception as exc:
+            result["fallback_chain"].append(f"캐시: 로드 실패 ({exc})")
+            result["error"] = (result.get("error") or "") + f" | 캐시 실패: {exc}"
 
     return result
 
@@ -389,14 +490,40 @@ def _fetch_yfinance_quote(symbol: str) -> Optional[dict]:
 def _fetch_hynix_daily_from_kis(mode: str, n_days: int) -> Optional[pd.DataFrame]:
     """KIS 국내주식 일봉 API로 SK하이닉스 수집."""
     import requests as rq
+
+    if mode == "real":
+        app_key    = os.environ.get("KIS_REAL_APP_KEY", "")
+        app_secret = os.environ.get("KIS_REAL_APP_SECRET", "")
+    else:
+        app_key    = os.environ.get("KIS_MOCK_APP_KEY", "")
+        app_secret = os.environ.get("KIS_MOCK_APP_SECRET", "")
+
+    account_no   = os.environ.get("KIS_ACCOUNT_NO", "00000000")
+    product_code = os.environ.get("KIS_ACCOUNT_PRODUCT_CODE", "01")
+
+    if not app_key or not app_secret:
+        raise ValueError(
+            f"KIS {mode} 인증 정보 없음 — "
+            f".env에서 KIS_{mode.upper()}_APP_KEY, KIS_{mode.upper()}_APP_SECRET 설정 필요"
+        )
+
     from app.trading.kis_client import KISClient
-
-    client = KISClient(mode=mode)
-    token  = client._get_token()
-
+    client = KISClient(
+        app_key=app_key,
+        app_secret=app_secret,
+        account_no=account_no,
+        product_code=product_code,
+        mode=mode,
+    )
+    token    = client.get_access_token()
     base_url = client.base_url
-    headers  = client._base_headers(tr_id="FHKST01010400")
-    headers["authorization"] = f"Bearer {token}"
+    headers  = {
+        "Content-Type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {token}",
+        "appkey": app_key,
+        "appsecret": app_secret,
+        "tr_id": "FHKST01010400",
+    }
 
     end_date   = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=n_days + 30)).strftime("%Y%m%d")
@@ -409,10 +536,14 @@ def _fetch_hynix_daily_from_kis(mode: str, n_days: int) -> Optional[pd.DataFrame
         "FID_PERIOD_DIV_CODE":    "D",
         "FID_ORG_ADJ_PRC":        "0",
     }
-    resp = rq.get(f"{base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-price",
-                  headers=headers, params=params, timeout=15)
+    resp = rq.get(
+        f"{base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-price",
+        headers=headers, params=params, timeout=15,
+    )
     resp.raise_for_status()
-    body = resp.json()
+    body = _safe_json(resp)
+    if body is None:
+        raise ValueError("KIS 일봉 API 응답이 JSON이 아님 (HTML 또는 빈 응답)")
     rows = body.get("output2") or body.get("output") or []
     if not rows:
         return None
@@ -420,12 +551,15 @@ def _fetch_hynix_daily_from_kis(mode: str, n_days: int) -> Optional[pd.DataFrame
     records = []
     for r in rows:
         try:
+            close = float(r.get("stck_clpr", 0) or 0)
+            if close <= 0:
+                continue
             records.append({
                 "datetime": r.get("stck_bsop_date", ""),
                 "open":   float(r.get("stck_oprc", 0) or 0),
                 "high":   float(r.get("stck_hgpr", 0) or 0),
                 "low":    float(r.get("stck_lwpr", 0) or 0),
-                "close":  float(r.get("stck_clpr", 0) or 0),
+                "close":  close,
                 "volume": int(r.get("acml_vol", 0) or 0),
             })
         except Exception:
