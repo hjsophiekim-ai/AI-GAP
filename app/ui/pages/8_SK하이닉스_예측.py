@@ -54,6 +54,12 @@ except Exception:
     _explain_ok = False
 
 try:
+    from app.ml.hynix_forecast_engine import run_forecast, collection_rate_label
+    _engine_ok = True
+except Exception:
+    _engine_ok = False
+
+try:
     from app.storage.prediction_logger import log_prediction, load_predictions
     _log_ok = True
 except Exception:
@@ -148,8 +154,8 @@ if refresh_data:
 if auto_run:
     if not _collector_ok:
         st.error(f"자동 수집 모듈 로드 실패: {_collector_err}")
-    elif not (_auto_feat_ok and _pred_ok):
-        st.error("예측 모듈 로드 실패")
+    elif not _engine_ok:
+        st.error("예측 엔진 모듈 로드 실패 — app/ml/hynix_forecast_engine.py 확인")
     else:
         prog = st.progress(0, text="데이터 수집 시작...")
 
@@ -158,95 +164,80 @@ if auto_run:
             st.session_state["market_data"] = market_data
             st.session_state["collected_at"] = market_data.get("collected_at", "—")[:16]
 
-        prog.progress(40, text="Feature 계산 중...")
+        prog.progress(40, text="예측 파이프라인 실행 중...")
 
-        try:
-            auto_feat = build_auto_features(market_data)
+        engine_result = run_forecast(market_data)
+        st.session_state["engine_result"] = engine_result
+
+        auto_feat = engine_result.get("auto_features")
+        pred      = engine_result.get("prediction")
+        swing_res = engine_result.get("swing")
+        expl      = engine_result.get("explanation")
+        status    = engine_result.get("status", "blocked")
+        dq        = engine_result.get("data_quality", 0.0)
+
+        if auto_feat:
             st.session_state["auto_features"] = auto_feat
-        except Exception as fe:
-            st.error(f"Feature 계산 실패: {fe}")
-            auto_feat = None
+        if pred:
+            st.session_state["hynix_pred"] = pred
+        if swing_res:
+            st.session_state["hynix_swing"] = swing_res
+        if expl:
+            st.session_state["swing_explanation"] = expl
 
-        prog.progress(60, text="가격 예측 중...")
+        prog.progress(85, text="예측 로그 저장 중...")
 
-        if auto_feat is not None:
+        if pred is not None and _log_ok and auto_feat is not None:
             try:
-                pred = predict_hynix(
+                log_prediction(
+                    prediction=pred,
                     micron_features=auto_feat["micron_features"],
-                    **auto_feat["predictor_kwargs"],
+                    micron_current_price=market_data.get("mu", {}).get("current_price"),
+                    kospilab_inputs={
+                        "kospilab_expected_return_pct": auto_feat["predictor_kwargs"].get("kospilab_expected_return_pct"),
+                    },
+                    other_inputs={
+                        "sox_return_pct":     auto_feat["predictor_kwargs"].get("sox_return_pct"),
+                        "nvda_return_pct":    auto_feat["predictor_kwargs"].get("nvda_return_pct"),
+                        "qqq_return_pct":     auto_feat["predictor_kwargs"].get("qqq_return_pct"),
+                        "usd_krw_change_pct": auto_feat["predictor_kwargs"].get("usd_krw_change_pct"),
+                        "data_quality":       dq,
+                    },
                 )
-                st.session_state["hynix_pred"] = pred
-            except Exception as pe:
-                st.error(f"예측 실패: {pe}")
-                pred = None
+            except Exception:
+                pass
 
-            prog.progress(75, text="스윙 플래그 계산 중...")
-
-            if _swing_ok and pred is not None:
-                try:
-                    swing = evaluate_swing_flag(
-                        micron_features=auto_feat["micron_features"],
-                        prediction=pred,
-                        **auto_feat["swing_kwargs"],
-                    )
-                    st.session_state["hynix_swing"] = swing
-
-                    if _explain_ok:
-                        expl = generate_swing_explanation(
-                            swing_result=swing,
-                            micron_features=auto_feat["micron_features"],
-                            tech_indicators=auto_feat["tech_indicators"],
-                            kospilab_return=auto_feat.get("kospilab_return"),
-                        )
-                        st.session_state["swing_explanation"] = expl
-                except Exception as se:
-                    st.warning(f"스윙 플래그 계산 실패: {se}")
-
-            prog.progress(85, text="예측 로그 저장 중...")
-
-            if pred is not None and _log_ok:
-                try:
-                    log_prediction(
-                        prediction=pred,
-                        micron_features=auto_feat["micron_features"],
-                        micron_current_price=market_data.get("mu", {}).get("current_price"),
-                        kospilab_inputs={
-                            "kospilab_expected_return_pct": auto_feat["predictor_kwargs"].get("kospilab_expected_return_pct"),
-                        },
-                        other_inputs={
-                            "sox_return_pct":     auto_feat["predictor_kwargs"].get("sox_return_pct"),
-                            "nvda_return_pct":    auto_feat["predictor_kwargs"].get("nvda_return_pct"),
-                            "qqq_return_pct":     auto_feat["predictor_kwargs"].get("qqq_return_pct"),
-                            "usd_krw_change_pct": auto_feat["predictor_kwargs"].get("usd_krw_change_pct"),
-                            "data_quality":       auto_feat.get("data_quality"),
-                        },
-                    )
-                except Exception:
-                    pass
-
-            swing = st.session_state.get("hynix_swing")
-            if swing is not None and _swing_log_ok:
-                try:
-                    log_swing_flag(
-                        swing_result=swing,
-                        hynix_prev_close=auto_feat.get("hynix_prev_close"),
-                        micron_features=auto_feat["micron_features"],
-                        kospilab_return=auto_feat.get("kospilab_return"),
-                        tech_indicators=auto_feat["tech_indicators"],
-                    )
-                except Exception:
-                    pass
+        if swing_res is not None and _swing_log_ok and auto_feat is not None:
+            try:
+                log_swing_flag(
+                    swing_result=swing_res,
+                    hynix_prev_close=auto_feat.get("hynix_prev_close"),
+                    micron_features=auto_feat["micron_features"],
+                    kospilab_return=auto_feat.get("kospilab_return"),
+                    tech_indicators=auto_feat.get("tech_indicators", {}),
+                )
+            except Exception:
+                pass
 
         prog.progress(100, text="완료!")
 
-        # 수집 오류 표시
-        errors = market_data.get("errors", [])
-        if errors:
-            with st.expander(f"수집 경고 ({len(errors)}건)"):
-                for e in errors:
-                    st.warning(e)
+        # ── 수집률 게이트 결과 표시 ───────────────────────────────────────────
+        rate_label, rate_color = collection_rate_label(dq)
+        rate_pct = f"{dq * 100:.0f}%"
+
+        if status == "blocked":
+            st.error(f"🔴 **데이터 수집률 {rate_pct} ({rate_label})** — {engine_result.get('message', '')}")
+        elif status == "low_confidence":
+            st.warning(f"🟡 **데이터 수집률 {rate_pct} ({rate_label})** — {engine_result.get('message', '')}")
         else:
-            st.success("모든 데이터 수집 및 예측 완료!")
+            st.success(f"🟢 **데이터 수집률 {rate_pct} ({rate_label})** — 예측 완료")
+
+        # 수집 오류 상세
+        all_errors = engine_result.get("errors", []) + market_data.get("errors", [])
+        if all_errors:
+            with st.expander(f"수집 오류 상세 ({len(all_errors)}건)"):
+                for e in all_errors:
+                    st.warning(e)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 수집 데이터 현황 표시
@@ -318,24 +309,46 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 
 if swing is not None and _swing_ok:
-    flag_val   = swing.get("swing_flag", "NEUTRAL")
-    flag_label = swing.get("flag_label", "관망")
-    flag_color = swing.get("flag_color", "#95a5a6")
-    score      = swing.get("swing_score", 50.0)
+    flag_val    = swing.get("swing_flag", "NEUTRAL")
+    flag_label  = swing.get("flag_label", "관망")
+    flag_color  = swing.get("flag_color", "#95a5a6")
+    score       = swing.get("swing_score", 50.0)
+    cf          = swing.get("confidence_score", 0.0)
+    action_text = swing.get("action_text", "—")
 
     st.subheader("스윙 매매 플래그")
+
+    # ── 핵심 카드: 플래그 + 액션 + 신뢰도 ───────────────────────────────────
     st.markdown(
         f"""<div style="background:{flag_color};color:#fff;padding:18px 28px;
-border-radius:12px;text-align:center;margin-bottom:20px;">
-  <div style="font-size:1.1rem;opacity:0.9;margin-bottom:4px;">현재 플래그</div>
-  <div style="font-size:2rem;font-weight:bold;">{flag_label}</div>
-  <div style="font-size:2.8rem;font-weight:bold;margin:4px 0;">{score:.1f}점</div>
-  <div style="font-size:0.85rem;opacity:0.85;">Swing Score 0~100 | {flag_val}</div>
+border-radius:12px;text-align:center;margin-bottom:12px;">
+  <div style="font-size:1.0rem;opacity:0.88;margin-bottom:2px;">현재 플래그 · Swing Score {score:.0f}/100</div>
+  <div style="font-size:2.4rem;font-weight:bold;margin:6px 0;">{flag_label}</div>
+  <div style="font-size:1.15rem;font-weight:600;margin:8px 0;opacity:0.97;">{action_text}</div>
+  <div style="font-size:0.80rem;opacity:0.78;">신뢰도 {cf:.0f}/100 · {flag_val}</div>
 </div>""",
         unsafe_allow_html=True,
     )
 
-    # 확률 & 신뢰도
+    # ── 구체적 매매 타이밍 ────────────────────────────────────────────────────
+    buy_txt    = swing.get("buy_timing_text")
+    sell_txt   = swing.get("sell_timing_text")
+    bot_win    = swing.get("bottom_window_text")
+    top_win    = swing.get("top_window_text")
+
+    timing_lines = []
+    if buy_txt:
+        timing_lines.append(f"📥 **매수 타이밍:** {buy_txt}")
+    if sell_txt:
+        timing_lines.append(f"📤 **매도 타이밍:** {sell_txt}")
+    if bot_win:
+        timing_lines.append(f"🔵 **저점 예상:** {bot_win}")
+    if top_win:
+        timing_lines.append(f"🔴 **고점 예상:** {top_win}")
+    if timing_lines:
+        st.markdown("  \n".join(timing_lines))
+
+    # ── 확률 & 신뢰도 ─────────────────────────────────────────────────────────
     sw1, sw2, sw3 = st.columns(3)
     with sw1:
         bp = swing.get("bottom_probability", 0.0)
@@ -344,10 +357,9 @@ border-radius:12px;text-align:center;margin-bottom:20px;">
         tp = swing.get("top_probability", 0.0)
         st.metric("단기 고점 확률", f"{tp:.1f}%")
     with sw3:
-        cf = swing.get("confidence_score", 0.0)
         st.metric("신뢰도", f"{cf:.1f}/100")
 
-    # 가격 구간 & 매매 가이드
+    # ── 가격 구간 & 매매 가이드 ───────────────────────────────────────────────
     st.markdown("#### 매매 가이드")
     pg1, pg2, pg3, pg4 = st.columns(4)
     _pfmt = lambda v: f"{v:,.0f}원" if v else "—"
@@ -363,7 +375,7 @@ border-radius:12px;text-align:center;margin-bottom:20px;">
         hold_days = swing.get("expected_holding_days")
         st.metric("예상 보유기간", f"{hold_days}거래일" if hold_days else "—")
 
-    # 판단 이유
+    # ── 판단 이유 (explainer) ────────────────────────────────────────────────
     if swing_expl:
         st.markdown(
             f'<div style="background:#f8f9fa;border-left:4px solid {flag_color};'

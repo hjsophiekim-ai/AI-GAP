@@ -268,24 +268,34 @@ def evaluate_swing_flag(
     # ── 신뢰도 ────────────────────────────────────────────────────────────────
     confidence = _compute_confidence(comp, ti, micron_features)
 
+    # ── 구체적 매매 액션 텍스트 ───────────────────────────────────────────────
+    hold_days = _holding_days(flag)
+    action_texts = _generate_action_texts(flag, prices, bottom_prob, top_prob, hold_days)
+
     return {
-        "swing_score":          swing_score,
-        "swing_flag":           flag,
-        "flag_label":           FLAG_LABELS.get(flag, flag),
-        "flag_color":           FLAG_COLORS.get(flag, "#95a5a6"),
-        "bottom_probability":   bottom_prob,
-        "top_probability":      top_prob,
-        "buy_zone_low":         prices["buy_zone_low"],
-        "buy_zone_high":        prices["buy_zone_high"],
-        "sell_zone_low":        prices["sell_zone_low"],
-        "sell_zone_high":       prices["sell_zone_high"],
-        "target_price":         prices["target_price"],
-        "stop_loss_price":      prices["stop_loss_price"],
-        "expected_holding_days": _holding_days(flag),
-        "confidence_score":     confidence,
-        "component_scores":     {k: round(v, 4) for k, v in comp.items()},
-        "composite_signal":     round(composite, 4),
-        "weights_used":         weights,
+        "swing_score":           swing_score,
+        "swing_flag":            flag,
+        "flag_label":            FLAG_LABELS.get(flag, flag),
+        "flag_color":            FLAG_COLORS.get(flag, "#95a5a6"),
+        "bottom_probability":    bottom_prob,
+        "top_probability":       top_prob,
+        "buy_zone_low":          prices["buy_zone_low"],
+        "buy_zone_high":         prices["buy_zone_high"],
+        "sell_zone_low":         prices["sell_zone_low"],
+        "sell_zone_high":        prices["sell_zone_high"],
+        "target_price":          prices["target_price"],
+        "stop_loss_price":       prices["stop_loss_price"],
+        "expected_holding_days": hold_days,
+        "confidence_score":      confidence,
+        "component_scores":      {k: round(v, 4) for k, v in comp.items()},
+        "composite_signal":      round(composite, 4),
+        "weights_used":          weights,
+        # 구체적 액션 텍스트
+        "action_text":           action_texts["action_text"],
+        "buy_timing_text":       action_texts["buy_timing_text"],
+        "sell_timing_text":      action_texts["sell_timing_text"],
+        "bottom_window_text":    action_texts["bottom_window_text"],
+        "top_window_text":       action_texts["top_window_text"],
     }
 
 
@@ -299,19 +309,25 @@ def _norm(val: Optional[float], scale: float) -> float:
 
 
 def _micron_signal(features: dict) -> float:
-    """마이크론 프리마켓 방향 신호 (-1 ~ +1)."""
-    pm_ret   = features.get("micron_premarket_return") or 0.0
-    mom30    = features.get("micron_premarket_30m_momentum") or 0.0
-    mom60    = features.get("micron_premarket_60m_momentum") or 0.0
-    strength = features.get("micron_session_strength_score") or 50.0
-    af_ret   = features.get("micron_aftermarket_return") or 0.0
-    return (
-        _norm(pm_ret, 3.0)   * 0.40
-        + _norm(mom30, 2.0)  * 0.20
-        + _norm(mom60, 2.0)  * 0.15
-        + (strength - 50) / 50 * 0.15
-        + _norm(af_ret, 2.0) * 0.10
-    )
+    """마이크론 프리마켓 방향 신호 (-1 ~ +1). 없는 서브-신호는 가중치에서 제외."""
+    pm_ret   = features.get("micron_premarket_return")
+    mom30    = features.get("micron_premarket_30m_momentum")
+    mom60    = features.get("micron_premarket_60m_momentum")
+    strength = features.get("micron_session_strength_score")
+    af_ret   = features.get("micron_aftermarket_return")
+
+    num, den = 0.0, 0.0
+    for val, scale, w in [
+        (pm_ret, 3.0, 0.40), (mom30, 2.0, 0.20),
+        (mom60, 2.0, 0.15), (af_ret, 2.0, 0.10),
+    ]:
+        if val is not None:
+            num += _norm(val, scale) * w
+            den += w
+    if strength is not None:
+        num += (strength - 50) / 50 * 0.15
+        den += 0.15
+    return num / den if den > 0 else 0.0
 
 
 def _kospilab_signal(kospilab_return: Optional[float]) -> float:
@@ -406,7 +422,9 @@ def _semi_signal(
 
 def _currency_signal(usd_krw: Optional[float]) -> float:
     """USD/KRW 환율 리스크 신호 (환율 상승 = 외국인 수급 약화 = 부정)."""
-    return _norm(-(usd_krw or 0.0), 1.5)
+    if usd_krw is None:
+        return 0.0
+    return _norm(-usd_krw, 1.5)
 
 
 # ── 저점/고점 확률 ────────────────────────────────────────────────────────────
@@ -421,30 +439,38 @@ def _compute_bottom_top_prob(
 
     두 확률은 독립적으로 계산 (합이 100이 아니어도 됨).
     """
-    rsi      = ti.get("rsi_14") or 50.0
-    from_high = ti.get("from_20d_high_pct") or 0.0
-    from_low  = ti.get("from_20d_low_pct") or 0.0
-    bb        = ti.get("bollinger_pct") or 50.0
-    strength  = micron_features.get("micron_session_strength_score") or 50.0
+    rsi      = ti.get("rsi_14")
+    from_high = ti.get("from_20d_high_pct")
+    from_low  = ti.get("from_20d_low_pct")
+    bb        = ti.get("bollinger_pct")
+    strength  = micron_features.get("micron_session_strength_score")
 
     # 저점 확률: RSI 과매도, 20일 저점 근접, 볼린저 하단, 마이크론 강세
-    bottom_signals = [
-        max(0, (30 - rsi) / 30) * 30,               # RSI 과매도 기여
-        max(0, -from_high / 15) * 20,                # 20일 고점 대비 하락
-        max(0, (20 - bb) / 20) * 20,                 # 볼린저 하단 근접
-        max(0, (strength - 50) / 50) * 20,           # 마이크론 강세
-        max(0, (50 - from_low) / 50) * 10,           # 저점 근접
-    ]
+    bottom_signals = []
+    if rsi is not None:
+        bottom_signals.append(max(0, (30 - rsi) / 30) * 30)
+    if from_high is not None:
+        bottom_signals.append(max(0, -from_high / 15) * 20)
+    if bb is not None:
+        bottom_signals.append(max(0, (20 - bb) / 20) * 20)
+    if strength is not None:
+        bottom_signals.append(max(0, (strength - 50) / 50) * 20)
+    if from_low is not None:
+        bottom_signals.append(max(0, (50 - from_low) / 50) * 10)
     bottom_prob = round(min(sum(bottom_signals), 95.0), 1)
 
     # 고점 확률: RSI 과매수, 20일 고점 근접, 볼린저 상단, 마이크론 약세
-    top_signals = [
-        max(0, (rsi - 70) / 30) * 30,               # RSI 과매수 기여
-        max(0, (-from_high - 0) / 5) * 20,           # 20일 고점 근접
-        max(0, (bb - 80) / 20) * 20,                 # 볼린저 상단 근접
-        max(0, (50 - strength) / 50) * 20,           # 마이크론 약세
-        max(0, from_low / 20) * 10,                  # 저점 대비 많이 오름
-    ]
+    top_signals = []
+    if rsi is not None:
+        top_signals.append(max(0, (rsi - 70) / 30) * 30)
+    if from_high is not None:
+        top_signals.append(max(0, (-from_high - 0) / 5) * 20)
+    if bb is not None:
+        top_signals.append(max(0, (bb - 80) / 20) * 20)
+    if strength is not None:
+        top_signals.append(max(0, (50 - strength) / 50) * 20)
+    if from_low is not None:
+        top_signals.append(max(0, from_low / 20) * 10)
     top_prob = round(min(sum(top_signals), 95.0), 1)
 
     return bottom_prob, top_prob
@@ -508,6 +534,79 @@ def _compute_price_zones(
         "sell_zone_high":  _r(sell_high),
         "target_price":    _r(target),
         "stop_loss_price": _r(stop_loss),
+    }
+
+
+# ── 구체적 매매 액션 텍스트 ──────────────────────────────────────────────────
+
+def _generate_action_texts(
+    flag: str,
+    prices: dict,
+    bottom_prob: float,
+    top_prob: float,
+    hold_days: Optional[int],
+) -> dict:
+    """플래그와 가격 구간에서 구체적인 한글 액션 텍스트를 생성합니다."""
+    buy_low  = prices.get("buy_zone_low")
+    buy_high = prices.get("buy_zone_high")
+    target   = prices.get("target_price")
+    stop     = prices.get("stop_loss_price")
+
+    def _p(v: Optional[int]) -> str:
+        return f"{v:,}원" if v else "—"
+
+    def _days(n: Optional[int]) -> str:
+        return f"{n}거래일 이내" if n else "단기"
+
+    if flag == STRONG_BUY:
+        action_text        = f"즉시 분할 매수 진입 — {_p(buy_low)}~{_p(buy_high)} 구간"
+        buy_timing_text    = f"{_p(buy_low)} ~ {_p(buy_high)} 구간에서 분할 매수 진입"
+        sell_timing_text   = f"{_p(target)} 부근에서 분할 매도 (손절: {_p(stop)})"
+        bottom_window_text = f"{_days(hold_days)} {_p(buy_low)} 부근에서 단기 저점 가능성 (확률 {bottom_prob:.0f}%)"
+        top_window_text    = f"{_days((hold_days or 3) * 2)} {_p(target)} 부근에서 단기 고점 가능성"
+    elif flag == BUY:
+        action_text        = f"분할 매수 — {_p(buy_low)}~{_p(buy_high)} 구간"
+        buy_timing_text    = f"{_p(buy_low)} ~ {_p(buy_high)} 구간에서 분할 매수"
+        sell_timing_text   = f"{_p(target)} 부근에서 분할 매도 (손절: {_p(stop)})"
+        bottom_window_text = f"{_days(hold_days)} {_p(buy_low)} 부근에서 저점 매수 기회"
+        top_window_text    = f"{_days((hold_days or 5) + 3)} {_p(target)} 부근에서 목표가 도달 예상"
+    elif flag == WAIT_BUY:
+        action_text        = f"눌림목 대기 — {_p(buy_low)} 이하로 하락 시 매수 검토"
+        buy_timing_text    = f"{_p(buy_low)} 이하로 추가 하락 시 매수 진입"
+        sell_timing_text   = f"{_p(target)} 부근에서 분할 매도"
+        bottom_window_text = f"{_days(hold_days)} 추가 눌림목 후 {_p(buy_low)} 부근 저점 가능성"
+        top_window_text    = None
+    elif flag == NEUTRAL:
+        action_text        = "방향성 불확실 — 관망 유지"
+        buy_timing_text    = None
+        sell_timing_text   = None
+        bottom_window_text = None
+        top_window_text    = None
+    elif flag == TAKE_PROFIT:
+        action_text        = f"분할 매도 검토 — {_p(target)} 부근 목표가 도달"
+        buy_timing_text    = None
+        sell_timing_text   = f"{_p(target)} 부근에서 보유 물량 분할 매도"
+        bottom_window_text = None
+        top_window_text    = f"{_days(hold_days)} 내 {_p(target)} 부근에서 단기 고점 가능성 (확률 {top_prob:.0f}%)"
+    elif flag == SELL:
+        action_text        = f"매도 후 현금 보유 — 손절라인: {_p(stop)}"
+        buy_timing_text    = None
+        sell_timing_text   = f"{_p(target)} 이하로 하락 시 추가 손절 고려"
+        bottom_window_text = None
+        top_window_text    = f"{_days(hold_days)} 내 추가 하락 가능성 (확률 {top_prob:.0f}%)"
+    else:  # STRONG_SELL
+        action_text        = f"즉시 손절/전량 매도 — 손절라인: {_p(stop)}"
+        buy_timing_text    = None
+        sell_timing_text   = f"즉시 전량 매도, 손절라인 {_p(stop)} 엄수"
+        bottom_window_text = None
+        top_window_text    = f"단기 급락 주의 (확률 {top_prob:.0f}%)"
+
+    return {
+        "action_text":        action_text,
+        "buy_timing_text":    buy_timing_text,
+        "sell_timing_text":   sell_timing_text,
+        "bottom_window_text": bottom_window_text,
+        "top_window_text":    top_window_text,
     }
 
 

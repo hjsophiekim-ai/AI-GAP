@@ -95,11 +95,13 @@ def predict_hynix(
     )
 
     # 기준 가격: 전일 종가 > 코스피랩 예상가 역산 > 0
-    base_price = hynix_prev_close or 0.0
-    if base_price <= 0 and kospilab_expected_price and kospilab_expected_return_pct is not None:
+    base_price = hynix_prev_close
+    if (base_price is None or base_price <= 0) and kospilab_expected_price and kospilab_expected_return_pct is not None:
         base_price = kospilab_expected_price / (1 + kospilab_expected_return_pct / 100)
-    if base_price <= 0 and kospilab_expected_price:
+    if (base_price is None or base_price <= 0) and kospilab_expected_price:
         base_price = kospilab_expected_price
+    if base_price is None:
+        base_price = 0.0
 
     today_prices   = _estimate_price_range(base_price, today_return_pct, composite)
     tomorrow_return = _estimate_future_return(composite, days=1)
@@ -154,42 +156,52 @@ def _build_signals(
     hynix_return_5d: Optional[float],
     hynix_volume_change: Optional[float],
 ) -> dict:
-    """각 지표를 -1 ~ +1 방향 신호로 변환."""
-    pm_ret   = micron_features.get("micron_premarket_return") or 0.0
-    pm_mom30 = micron_features.get("micron_premarket_30m_momentum") or 0.0
-    pm_mom60 = micron_features.get("micron_premarket_60m_momentum") or 0.0
-    strength = micron_features.get("micron_session_strength_score") or 50.0
-    af_ret   = micron_features.get("micron_aftermarket_return") or 0.0
+    """각 지표를 -1 ~ +1 방향 신호로 변환. 데이터 없으면 None."""
+    pm_ret   = micron_features.get("micron_premarket_return")
+    pm_mom30 = micron_features.get("micron_premarket_30m_momentum")
+    pm_mom60 = micron_features.get("micron_premarket_60m_momentum")
+    strength = micron_features.get("micron_session_strength_score")
+    af_ret   = micron_features.get("micron_aftermarket_return")
 
-    micron_signal = (
-        _norm(pm_ret, 3.0) * 0.40
-        + _norm(pm_mom30, 2.0) * 0.20
-        + _norm(pm_mom60, 2.0) * 0.15
-        + (strength - 50) / 50 * 0.15
-        + _norm(af_ret, 2.0) * 0.10
-    )
+    # 마이크론 신호: 가용한 서브-신호만 집계, 가중 평균으로 정규화
+    mu_num, mu_den = 0.0, 0.0
+    for val, scale, w in [
+        (pm_ret, 3.0, 0.40), (pm_mom30, 2.0, 0.20),
+        (pm_mom60, 2.0, 0.15), (af_ret, 2.0, 0.10),
+    ]:
+        if val is not None:
+            mu_num += _norm(val, scale) * w
+            mu_den += w
+    if strength is not None:
+        mu_num += (strength - 50) / 50 * 0.15
+        mu_den += 0.15
+    micron_signal = mu_num / mu_den if mu_den > 0 else None
 
-    hynix_self = (
-        _norm(hynix_prev_return, 3.0) * 0.30
-        + _norm(hynix_return_3d, 5.0) * 0.30
-        + _norm(hynix_return_5d, 7.0) * 0.20
-        + _norm(hynix_volume_change, 30.0) * 0.20
-    )
+    # 하이닉스 자체 신호: 가용한 것만 집계
+    hy_num, hy_den = 0.0, 0.0
+    for val, scale, w in [
+        (hynix_prev_return, 3.0, 0.30), (hynix_return_3d, 5.0, 0.30),
+        (hynix_return_5d, 7.0, 0.20), (hynix_volume_change, 30.0, 0.20),
+    ]:
+        if val is not None:
+            hy_num += _norm(val, scale) * w
+            hy_den += w
+    hynix_self = hy_num / hy_den if hy_den > 0 else None
 
     return {
-        "micron":      round(micron_signal, 4),
-        "kospilab":    round(_norm(kospilab_return, 2.0), 4),
-        "sox":         round(_norm(sox_return, 2.0), 4),
-        "nvda":        round(_norm(nvda_return, 3.0), 4),
-        "qqq":         round(_norm(qqq_return, 2.0), 4),
+        "micron":     round(micron_signal, 4) if micron_signal is not None else None,
+        "kospilab":   round(_norm(kospilab_return, 2.0), 4) if kospilab_return is not None else None,
+        "sox":        round(_norm(sox_return, 2.0), 4) if sox_return is not None else None,
+        "nvda":       round(_norm(nvda_return, 3.0), 4) if nvda_return is not None else None,
+        "qqq":        round(_norm(qqq_return, 2.0), 4) if qqq_return is not None else None,
         # 환율 상승은 외국인 수급에 부정적
-        "usd_krw":     round(_norm(-(usd_krw_change or 0.0), 1.5), 4),
-        "hynix_self":  round(hynix_self, 4),
+        "usd_krw":    round(_norm(-usd_krw_change, 1.5), 4) if usd_krw_change is not None else None,
+        "hynix_self": round(hynix_self, 4) if hynix_self is not None else None,
     }
 
 
 def _weighted_composite(signals: dict, weights: dict) -> float:
-    """신호 × 가중치 합산 → composite signal (-1 ~ +1 근사)."""
+    """신호 × 가중치 합산. None 신호는 제외하고 가용 가중치로 정규화."""
     mapping = {
         "micron":     "micron_premarket_aftermarket",
         "kospilab":   "kospilab_expected_price",
@@ -199,9 +211,14 @@ def _weighted_composite(signals: dict, weights: dict) -> float:
         "usd_krw":    "usd_krw",
         "hynix_self": "hynix_momentum_volume",
     }
-    total = sum(signals.get(s, 0.0) * weights.get(w, 0.0) for s, w in mapping.items())
-    weight_sum = sum(weights.get(w, 0.0) for w in mapping.values())
-    return total / max(weight_sum, 1e-9)
+    total, weight_sum = 0.0, 0.0
+    for s, w_key in mapping.items():
+        val = signals.get(s)
+        if val is not None:
+            w = weights.get(w_key, 0.0)
+            total += val * w
+            weight_sum += w
+    return total / weight_sum if weight_sum > 1e-9 else 0.0
 
 
 def _estimate_today_return(
@@ -336,16 +353,17 @@ def _estimate_confidence(signals: dict, micron_features: dict) -> float:
     신뢰도 점수 (0~100).
 
     데이터 충분성 40점 + 신호 일치도 30점 + 마이크론 강도 30점.
+    None 신호는 데이터 없음으로 처리 (0.0과 구별).
     """
-    available = sum(1 for v in signals.values() if v != 0.0)
+    available  = sum(1 for v in signals.values() if v is not None)
     data_score = available / max(len(signals), 1) * 40
 
-    positive   = sum(1 for v in signals.values() if v > 0.05)
-    negative   = sum(1 for v in signals.values() if v < -0.05)
+    positive   = sum(1 for v in signals.values() if v is not None and v > 0.05)
+    negative   = sum(1 for v in signals.values() if v is not None and v < -0.05)
     consensus  = abs(positive - negative) / max(len(signals), 1)
     cons_score = consensus * 30
 
-    strength     = micron_features.get("micron_session_strength_score") or 50.0
-    str_score    = abs(strength - 50) / 50 * 30
+    strength  = micron_features.get("micron_session_strength_score")
+    str_score = abs(strength - 50) / 50 * 30 if strength is not None else 0.0
 
     return round(min(data_score + cons_score + str_score, 100.0), 1)
