@@ -1,11 +1,11 @@
 """
-8_SK하이닉스_예측.py — SK하이닉스 가격 예측 탭.
+8_SK하이닉스_예측.py — SK하이닉스 완전 자동 예측 탭.
 
-마이크론(MU) 프리마켓 데이터를 핵심 선행지표로 사용하여
-SK하이닉스(000660)의 오늘/내일/3일 후 가격 흐름과
-향후 2주 단기 고점/저점을 예측합니다.
+"자동 예측 실행" 버튼 하나로:
+  MU·NVDA·SOX·QQQ·USD/KRW·SK하이닉스 일봉·코스피랩 참고가를 자동 수집하고
+  오늘/내일/3일/2주 가격 예측 + 스윙 매매 플래그를 출력합니다.
 
-이 페이지는 예측/분석 전용이며 실전 매매 기능과 연결되지 않습니다.
+실전 주문 기능과 절대 연결하지 않습니다.
 """
 
 from __future__ import annotations
@@ -17,49 +17,58 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-import json
-
 import pandas as pd
 import streamlit as st
 
-# ── 모듈 임포트 (graceful fallback) ──────────────────────────────────────────
+# ── 모듈 임포트 ───────────────────────────────────────────────────────────────
 
 try:
-    from app.data_sources.kis_overseas_minute import collect_and_save_mu, fetch_mu_current_price
-    _data_ok = True
-except Exception as _data_err:
-    _data_ok = False
-    _data_err_msg = str(_data_err)
+    from app.data_sources.auto_market_collector import collect_all
+    _collector_ok = True
+except Exception as _ce:
+    _collector_ok = False
+    _collector_err = str(_ce)
 
 try:
-    from app.features.micron_premarket_features import compute_micron_features
-    _feat_ok = True
-except Exception as _feat_err:
-    _feat_ok = False
+    from app.features.hynix_auto_features import build_auto_features
+    _auto_feat_ok = True
+except Exception:
+    _auto_feat_ok = False
 
 try:
     from app.models.hynix_predictor import predict_hynix
     _pred_ok = True
-except Exception as _pred_err:
+except Exception:
     _pred_ok = False
+
+try:
+    from app.models.hynix_swing_flag import evaluate_swing_flag, FLAG_COLORS, FLAG_LABELS
+    _swing_ok = True
+except Exception:
+    _swing_ok = False
+
+try:
+    from app.models.hynix_swing_explainer import generate_swing_explanation
+    _explain_ok = True
+except Exception:
+    _explain_ok = False
 
 try:
     from app.storage.prediction_logger import log_prediction, load_predictions
     _log_ok = True
-except Exception as _log_err:
+except Exception:
     _log_ok = False
 
 try:
-    from app.models.hynix_error_analyzer import analyze_prediction_error
-    _err_ok = True
+    from app.storage.swing_flag_logger import log_swing_flag, load_swing_flags
+    _swing_log_ok = True
 except Exception:
-    _err_ok = False
+    _swing_log_ok = False
 
 try:
     from app.models.hynix_weight_adjuster import (
-        load_weights,
-        save_weights,
-        adjust_weights_from_predictions,
+        load_weights, save_weights, adjust_weights_from_predictions,
+        load_swing_weights, save_swing_weights, adjust_swing_weights_from_flags,
     )
     _adj_ok = True
 except Exception:
@@ -74,227 +83,331 @@ _MICRON_3MIN = _ROOT / "data" / "micron" / "MU_3min.csv"
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.title("SK하이닉스 예측")
-st.caption("마이크론(MU) 프리마켓을 선행지표로 SK하이닉스(000660) 가격 흐름을 예측합니다.")
-
-if not (_data_ok and _feat_ok and _pred_ok):
-    st.error("필수 모듈 로드 실패. 서버 로그를 확인하세요.")
+st.caption("마이크론(MU) 프리마켓 + 자동 수집 데이터로 SK하이닉스(000660) 매매 신호를 생성합니다.")
 
 st.info(
-    "⚠️ 이 화면은 **투자 참고용**입니다. 예측값은 확률적 추정치이며, "
-    "실제 매매 손익에 대한 책임은 전적으로 사용자에게 있습니다.",
+    "⚠️ **투자 참고용** — 예측값은 확률적 추정치이며 실제 매매 손익의 책임은 전적으로 사용자에게 있습니다.",
     icon="⚠️",
 )
-st.divider()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 사이드바: KIS 모드 선택
+# 사이드바
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.subheader("데이터 수집 설정")
+    st.subheader("설정")
     api_mode = st.selectbox(
         "KIS API 모드",
         options=["real", "mock"],
         index=0,
         help="해외주식 분봉은 real 키를 권장합니다.",
     )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Section 1: MU 현재가 & 분봉 수집
-# ─────────────────────────────────────────────────────────────────────────────
-
-st.subheader("1. 마이크론(MU) 데이터")
-
-col_fetch, col_mu_price = st.columns([1, 3])
-
-with col_fetch:
-    fetch_clicked = st.button("MU 데이터 수집", use_container_width=True)
-
-if fetch_clicked:
-    if not _data_ok:
-        st.error(f"데이터 수집 모듈 로드 실패: {_data_err_msg}")
-    else:
-        with st.spinner("MU 데이터 수집 중..."):
-            result = collect_and_save_mu(mode=api_mode)
-        if result.get("error"):
-            st.warning(f"수집 주의: {result['error']}")
-        else:
-            st.success("MU 데이터 수집 완료")
-        st.session_state["mu_collect_result"] = result
-
-# MU 현재가 표시
-with col_mu_price:
-    mu_result = st.session_state.get("mu_collect_result", {})
-    cp = mu_result.get("current_price")
-    if cp:
-        st.metric(
-            label="MU 현재가 (USD)",
-            value=f"${cp['price']:.2f}",
-            delta=f"고: ${cp['high']:.2f}  저: ${cp['low']:.2f}",
-        )
-    else:
-        st.metric(label="MU 현재가", value="—")
-
-# 1분봉 차트
-df_1min_session = mu_result.get("df_1min")
-if df_1min_session is None and _MICRON_1MIN.exists():
-    try:
-        df_1min_session = pd.read_csv(_MICRON_1MIN, parse_dates=["datetime"])
-    except Exception:
-        df_1min_session = None
-
-tab1min, tab3min = st.tabs(["1분봉", "3분봉"])
-
-with tab1min:
-    if df_1min_session is not None and not df_1min_session.empty:
-        st.line_chart(df_1min_session.set_index("datetime")[["close"]])
-        with st.expander("1분봉 데이터 보기"):
-            st.dataframe(df_1min_session.tail(30), use_container_width=True)
-    else:
-        st.info("MU 1분봉 데이터 없음 — 위 버튼으로 수집하세요.")
-
-with tab3min:
-    df_3min_session = mu_result.get("df_3min")
-    if df_3min_session is None and _MICRON_3MIN.exists():
-        try:
-            df_3min_session = pd.read_csv(_MICRON_3MIN, parse_dates=["datetime"])
-        except Exception:
-            df_3min_session = None
-    if df_3min_session is not None and not df_3min_session.empty:
-        st.line_chart(df_3min_session.set_index("datetime")[["close"]])
-    else:
-        st.info("MU 3분봉 데이터 없음")
+    st.caption("API 키는 .env 파일에서만 읽습니다.")
 
 st.divider()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 2: 수동 입력 지표
+# 상단 컨트롤: 자동 예측 실행 / 새로고침
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.subheader("2. 보조 지표 입력 (수동)")
+top_c1, top_c2, top_c3 = st.columns([2, 1, 2])
 
-c1, c2 = st.columns(2)
-with c1:
-    kospilab_price = st.number_input(
-        "코스피랩 예상가격 (원)",
-        min_value=0.0, value=0.0, step=1000.0,
-        help="코스피랩에서 제공하는 SK하이닉스 예상 시가",
-    )
-    kospilab_return = st.number_input(
-        "코스피랩 예상등락률 (%)",
-        min_value=-20.0, max_value=20.0, value=0.0, step=0.01,
-    )
-    hynix_prev_close = st.number_input(
-        "SK하이닉스 전일 종가 (원)",
-        min_value=0.0, value=0.0, step=500.0,
-    )
-    hynix_prev_return = st.number_input(
-        "SK하이닉스 전일 등락률 (%)",
-        min_value=-30.0, max_value=30.0, value=0.0, step=0.01,
+with top_c1:
+    auto_run = st.button(
+        "자동 예측 실행",
+        type="primary",
+        use_container_width=True,
+        help="데이터 자동 수집 → feature 계산 → 예측 실행",
     )
 
-with c2:
-    sox_return = st.number_input(
-        "SOX 지수 등락률 (%)",
-        min_value=-15.0, max_value=15.0, value=0.0, step=0.01,
-    )
-    nvda_return = st.number_input(
-        "NVDA 등락률 (%)",
-        min_value=-20.0, max_value=20.0, value=0.0, step=0.01,
-    )
-    qqq_return = st.number_input(
-        "QQQ/나스닥 선물 등락률 (%)",
-        min_value=-15.0, max_value=15.0, value=0.0, step=0.01,
-    )
-    usd_krw_change = st.number_input(
-        "USD/KRW 환율 변화율 (%)",
-        min_value=-5.0, max_value=5.0, value=0.0, step=0.01,
+with top_c2:
+    refresh_data = st.button(
+        "데이터 새로고침",
+        use_container_width=True,
+        help="캐시를 초기화하고 최신 데이터를 다시 수집합니다.",
     )
 
-with st.expander("SK하이닉스 최근 수익률 입력 (선택)"):
-    hynix_3d  = st.number_input("최근 3일 수익률 (%)", value=0.0, step=0.01)
-    hynix_5d  = st.number_input("최근 5일 수익률 (%)", value=0.0, step=0.01)
-    hynix_10d = st.number_input("최근 10일 수익률 (%)", value=0.0, step=0.01)
-    hynix_vol = st.number_input("거래량 변화율 (%)", value=0.0, step=0.1)
-
-st.divider()
+with top_c3:
+    last_collected = st.session_state.get("collected_at", "—")
+    st.markdown(f"**마지막 수집:** {last_collected}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 3: 예측 실행
+# 데이터 새로고침
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.subheader("3. 예측 실행")
+if refresh_data:
+    for key in ["market_data", "auto_features", "hynix_pred", "hynix_swing",
+                "swing_explanation", "collected_at"]:
+        st.session_state.pop(key, None)
+    st.rerun()
 
-predict_clicked = st.button("예측 실행", type="primary", use_container_width=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# 자동 예측 실행
+# ─────────────────────────────────────────────────────────────────────────────
 
-if predict_clicked:
-    if not (_feat_ok and _pred_ok):
+if auto_run:
+    if not _collector_ok:
+        st.error(f"자동 수집 모듈 로드 실패: {_collector_err}")
+    elif not (_auto_feat_ok and _pred_ok):
         st.error("예측 모듈 로드 실패")
     else:
-        # feature 계산
-        mu_features = compute_micron_features(
-            df_1min=df_1min_session,
-            current_price=cp,
-        )
-        # 예측 실행
-        pred = predict_hynix(
-            micron_features=mu_features,
-            kospilab_expected_price=kospilab_price if kospilab_price > 0 else None,
-            kospilab_expected_return_pct=kospilab_return if kospilab_return != 0 else None,
-            sox_return_pct=sox_return if sox_return != 0 else None,
-            nvda_return_pct=nvda_return if nvda_return != 0 else None,
-            qqq_return_pct=qqq_return if qqq_return != 0 else None,
-            usd_krw_change_pct=usd_krw_change if usd_krw_change != 0 else None,
-            hynix_prev_close=hynix_prev_close if hynix_prev_close > 0 else None,
-            hynix_prev_return_pct=hynix_prev_return if hynix_prev_return != 0 else None,
-            hynix_return_3d_pct=hynix_3d if hynix_3d != 0 else None,
-            hynix_return_5d_pct=hynix_5d if hynix_5d != 0 else None,
-            hynix_return_10d_pct=hynix_10d if hynix_10d != 0 else None,
-            hynix_volume_change_pct=hynix_vol if hynix_vol != 0 else None,
-        )
-        st.session_state["hynix_pred"] = pred
-        st.session_state["mu_features"] = mu_features
+        prog = st.progress(0, text="데이터 수집 시작...")
 
-        # 로그 저장
-        if _log_ok:
+        with st.spinner("시장 데이터 자동 수집 중..."):
+            market_data = collect_all(mode=api_mode)
+            st.session_state["market_data"] = market_data
+            st.session_state["collected_at"] = market_data.get("collected_at", "—")[:16]
+
+        prog.progress(40, text="Feature 계산 중...")
+
+        try:
+            auto_feat = build_auto_features(market_data)
+            st.session_state["auto_features"] = auto_feat
+        except Exception as fe:
+            st.error(f"Feature 계산 실패: {fe}")
+            auto_feat = None
+
+        prog.progress(60, text="가격 예측 중...")
+
+        if auto_feat is not None:
             try:
-                log_prediction(
-                    prediction=pred,
-                    micron_features=mu_features,
-                    micron_current_price=cp,
-                    kospilab_inputs={
-                        "kospilab_expected_price": kospilab_price,
-                        "kospilab_expected_return_pct": kospilab_return,
-                    },
-                    other_inputs={
-                        "sox_return_pct": sox_return,
-                        "nvda_return_pct": nvda_return,
-                        "qqq_return_pct": qqq_return,
-                        "usd_krw_change_pct": usd_krw_change,
-                        "hynix_prev_return_pct": hynix_prev_return,
-                    },
+                pred = predict_hynix(
+                    micron_features=auto_feat["micron_features"],
+                    **auto_feat["predictor_kwargs"],
                 )
-            except Exception as log_exc:
-                st.warning(f"예측 로그 저장 실패: {log_exc}")
+                st.session_state["hynix_pred"] = pred
+            except Exception as pe:
+                st.error(f"예측 실패: {pe}")
+                pred = None
 
-        st.success("예측 완료!")
+            prog.progress(75, text="스윙 플래그 계산 중...")
+
+            if _swing_ok and pred is not None:
+                try:
+                    swing = evaluate_swing_flag(
+                        micron_features=auto_feat["micron_features"],
+                        prediction=pred,
+                        **auto_feat["swing_kwargs"],
+                    )
+                    st.session_state["hynix_swing"] = swing
+
+                    if _explain_ok:
+                        expl = generate_swing_explanation(
+                            swing_result=swing,
+                            micron_features=auto_feat["micron_features"],
+                            tech_indicators=auto_feat["tech_indicators"],
+                            kospilab_return=auto_feat.get("kospilab_return"),
+                        )
+                        st.session_state["swing_explanation"] = expl
+                except Exception as se:
+                    st.warning(f"스윙 플래그 계산 실패: {se}")
+
+            prog.progress(85, text="예측 로그 저장 중...")
+
+            if pred is not None and _log_ok:
+                try:
+                    log_prediction(
+                        prediction=pred,
+                        micron_features=auto_feat["micron_features"],
+                        micron_current_price=market_data.get("mu", {}).get("current_price"),
+                        kospilab_inputs={
+                            "kospilab_expected_return_pct": auto_feat["predictor_kwargs"].get("kospilab_expected_return_pct"),
+                        },
+                        other_inputs={
+                            "sox_return_pct":     auto_feat["predictor_kwargs"].get("sox_return_pct"),
+                            "nvda_return_pct":    auto_feat["predictor_kwargs"].get("nvda_return_pct"),
+                            "qqq_return_pct":     auto_feat["predictor_kwargs"].get("qqq_return_pct"),
+                            "usd_krw_change_pct": auto_feat["predictor_kwargs"].get("usd_krw_change_pct"),
+                            "data_quality":       auto_feat.get("data_quality"),
+                        },
+                    )
+                except Exception:
+                    pass
+
+            swing = st.session_state.get("hynix_swing")
+            if swing is not None and _swing_log_ok:
+                try:
+                    log_swing_flag(
+                        swing_result=swing,
+                        hynix_prev_close=auto_feat.get("hynix_prev_close"),
+                        micron_features=auto_feat["micron_features"],
+                        kospilab_return=auto_feat.get("kospilab_return"),
+                        tech_indicators=auto_feat["tech_indicators"],
+                    )
+                except Exception:
+                    pass
+
+        prog.progress(100, text="완료!")
+
+        # 수집 오류 표시
+        errors = market_data.get("errors", [])
+        if errors:
+            with st.expander(f"수집 경고 ({len(errors)}건)"):
+                for e in errors:
+                    st.warning(e)
+        else:
+            st.success("모든 데이터 수집 및 예측 완료!")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 4: 예측 결과 표시
+# 수집 데이터 현황 표시
 # ─────────────────────────────────────────────────────────────────────────────
 
-pred = st.session_state.get("hynix_pred")
-mu_features = st.session_state.get("mu_features", {})
+market_data  = st.session_state.get("market_data", {})
+auto_feat    = st.session_state.get("auto_features", {})
+pred         = st.session_state.get("hynix_pred")
+swing        = st.session_state.get("hynix_swing")
+swing_expl   = st.session_state.get("swing_explanation", "")
+
+if market_data:
+    with st.expander("자동 수집 데이터 현황", expanded=False):
+        mu_src  = market_data.get("mu", {}).get("source", "없음")
+        mu_cp   = market_data.get("mu", {}).get("current_price")
+        nv_src  = market_data.get("nvda", {}).get("source", "없음")
+        nv_ret  = market_data.get("nvda", {}).get("regular_return")
+        idx_src = market_data.get("index", {}).get("source", "없음")
+        hy_src  = market_data.get("hynix", {}).get("source", "없음")
+        kl_st   = market_data.get("kospilab", {}).get("source_status", "failed")
+        kl_ret  = market_data.get("kospilab", {}).get("hynix_reference_return")
+        kl_err  = market_data.get("kospilab", {}).get("error_message")
+        qqq     = market_data.get("index", {}).get("qqq_return")
+        sox     = market_data.get("index", {}).get("sox_return")
+        usdkrw  = market_data.get("index", {}).get("usdkrw_change")
+
+        dc1, dc2, dc3 = st.columns(3)
+        with dc1:
+            st.markdown(f"**MU** [{mu_src}]")
+            if mu_cp:
+                st.write(f"현재가: ${mu_cp.get('price', 0):.2f}")
+            mf = auto_feat.get("micron_features", {})
+            pm_ret = mf.get("micron_premarket_return")
+            if pm_ret is not None:
+                st.write(f"프리마켓: {pm_ret:+.2f}%")
+            strength = mf.get("micron_session_strength_score")
+            if strength is not None:
+                st.write(f"강도: {strength:.0f}/100")
+        with dc2:
+            st.markdown(f"**NVDA** [{nv_src}]")
+            if nv_ret is not None:
+                st.write(f"등락률: {nv_ret:+.2f}%")
+            st.markdown(f"**SOX/QQQ** [{idx_src}]")
+            if sox is not None:
+                st.write(f"SOXX: {sox:+.2f}%")
+            if qqq is not None:
+                st.write(f"QQQ: {qqq:+.2f}%")
+            if usdkrw is not None:
+                st.write(f"USD/KRW: {usdkrw:+.2f}%")
+        with dc3:
+            st.markdown(f"**코스피랩** [{kl_st}]")
+            if kl_ret is not None:
+                st.write(f"하이닉스 참고 등락률: {kl_ret:+.2f}%")
+            elif kl_err:
+                st.write(f"실패: {kl_err[:60]}...")
+            st.markdown(f"**하이닉스 일봉** [{hy_src}]")
+            prev_close = auto_feat.get("hynix_prev_close")
+            if prev_close:
+                st.write(f"전일 종가: {prev_close:,.0f}원")
+
+        # 데이터 품질
+        quality = auto_feat.get("data_quality", 0)
+        st.metric("데이터 품질 점수", f"{quality*100:.0f}/100", help="0=데이터 없음, 100=모든 데이터 수집 성공")
+
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 스윙 매매 플래그 — 핵심 결과 (최상단 표시)
+# ─────────────────────────────────────────────────────────────────────────────
+
+if swing is not None and _swing_ok:
+    flag_val   = swing.get("swing_flag", "NEUTRAL")
+    flag_label = swing.get("flag_label", "관망")
+    flag_color = swing.get("flag_color", "#95a5a6")
+    score      = swing.get("swing_score", 50.0)
+
+    st.subheader("스윙 매매 플래그")
+    st.markdown(
+        f"""<div style="background:{flag_color};color:#fff;padding:18px 28px;
+border-radius:12px;text-align:center;margin-bottom:20px;">
+  <div style="font-size:1.1rem;opacity:0.9;margin-bottom:4px;">현재 플래그</div>
+  <div style="font-size:2rem;font-weight:bold;">{flag_label}</div>
+  <div style="font-size:2.8rem;font-weight:bold;margin:4px 0;">{score:.1f}점</div>
+  <div style="font-size:0.85rem;opacity:0.85;">Swing Score 0~100 | {flag_val}</div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+    # 확률 & 신뢰도
+    sw1, sw2, sw3 = st.columns(3)
+    with sw1:
+        bp = swing.get("bottom_probability", 0.0)
+        st.metric("단기 저점 확률", f"{bp:.1f}%")
+    with sw2:
+        tp = swing.get("top_probability", 0.0)
+        st.metric("단기 고점 확률", f"{tp:.1f}%")
+    with sw3:
+        cf = swing.get("confidence_score", 0.0)
+        st.metric("신뢰도", f"{cf:.1f}/100")
+
+    # 가격 구간 & 매매 가이드
+    st.markdown("#### 매매 가이드")
+    pg1, pg2, pg3, pg4 = st.columns(4)
+    _pfmt = lambda v: f"{v:,.0f}원" if v else "—"
+    with pg1:
+        st.metric("매수 적정 구간",
+                  _pfmt(swing.get("buy_zone_low")),
+                  delta=f"~ {_pfmt(swing.get('buy_zone_high'))}")
+    with pg2:
+        st.metric("목표가 (분할매도)", _pfmt(swing.get("target_price")))
+    with pg3:
+        st.metric("손절가", _pfmt(swing.get("stop_loss_price")))
+    with pg4:
+        hold_days = swing.get("expected_holding_days")
+        st.metric("예상 보유기간", f"{hold_days}거래일" if hold_days else "—")
+
+    # 판단 이유
+    if swing_expl:
+        st.markdown(
+            f'<div style="background:#f8f9fa;border-left:4px solid {flag_color};'
+            f'padding:12px 16px;border-radius:4px;line-height:1.8;margin-top:8px;">'
+            f'{swing_expl}</div>',
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("컴포넌트별 신호"):
+        comp = swing.get("component_scores", {})
+        comp_labels = {
+            "micron_premarket": "마이크론 프리마켓",
+            "kospilab":         "코스피랩",
+            "tech_position":    "기술적 지표",
+            "volume_momentum":  "거래량/수급",
+            "semiconductor":    "반도체 지수",
+            "currency_risk":    "환율 리스크",
+        }
+        comp_df = pd.DataFrame([
+            {"지표": comp_labels.get(k, k),
+             "신호": f"{v:+.4f}",
+             "방향": "▲ 매수" if v > 0.05 else ("▼ 매도" if v < -0.05 else "중립")}
+            for k, v in comp.items()
+        ])
+        st.dataframe(comp_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+elif not (auto_run or market_data):
+    st.info("'자동 예측 실행' 버튼을 누르면 스윙 플래그와 가격 예측이 자동으로 생성됩니다.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 가격 예측 결과
+# ─────────────────────────────────────────────────────────────────────────────
 
 if pred:
-    st.divider()
-    st.subheader("4. 예측 결과")
+    st.subheader("가격 예측 결과")
 
-    # ── 오늘 예상 흐름 ───────────────────────────────────────────────────────
+    _fmt = lambda v: f"{v:,.0f}원" if v else "—"
+
+    # 오늘 예상 OHLC
     st.markdown("#### 오늘 예상 흐름")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        _fmt = lambda v: f"{v:,}원" if v else "—"
         st.metric("예상 시가", _fmt(pred.get("today_open_expected")))
     with c2:
         st.metric("예상 고가", _fmt(pred.get("today_high_expected")))
@@ -302,15 +415,10 @@ if pred:
         st.metric("예상 저가", _fmt(pred.get("today_low_expected")))
     with c4:
         ret = pred.get("today_return_pct", 0)
-        color = "normal" if ret == 0 else ("inverse" if ret < 0 else "normal")
-        st.metric(
-            "예상 종가 (등락률)",
-            _fmt(pred.get("today_close_expected")),
-            delta=f"{ret:+.2f}%",
-        )
+        st.metric("예상 종가", _fmt(pred.get("today_close_expected")), delta=f"{ret:+.2f}%")
 
-    # ── 내일 / 3일 후 ────────────────────────────────────────────────────────
-    st.markdown("#### 단기 예상 흐름")
+    # 단기 예상
+    st.markdown("#### 단기 예상")
     ca, cb = st.columns(2)
     with ca:
         t_ret = pred.get("tomorrow_return_pct", 0)
@@ -319,130 +427,331 @@ if pred:
         d3_ret = pred.get("day3_return_pct", 0)
         st.metric("3일 후 예상 등락률", f"{d3_ret:+.2f}%")
 
-    # ── 향후 2주 ─────────────────────────────────────────────────────────────
+    # 2주 예상
     st.markdown("#### 향후 2주 예상")
     cw1, cw2 = st.columns(2)
     with cw1:
         st.markdown(
-            f"""
-**향후 2주 최고점**
-- 예상일: {pred.get('two_week_high_date', '—')}
-- 예상가: {f"{pred.get('two_week_high_price', 0):,}원" if pred.get('two_week_high_price') else '—'}
-- 확률: {f"{pred.get('two_week_high_prob', 0)*100:.0f}%" if pred.get('two_week_high_prob') else '—'}
-"""
+            f"**향후 2주 최고점**\n"
+            f"- 예상일: {pred.get('two_week_high_date', '—')}\n"
+            f"- 예상가: {_fmt(pred.get('two_week_high_price'))}\n"
+            f"- 확률: {pred.get('two_week_high_prob', 0)*100:.0f}%"
         )
     with cw2:
         st.markdown(
-            f"""
-**향후 2주 최저점**
-- 예상일: {pred.get('two_week_low_date', '—')}
-- 예상가: {f"{pred.get('two_week_low_price', 0):,}원" if pred.get('two_week_low_price') else '—'}
-- 확률: {f"{pred.get('two_week_low_prob', 0)*100:.0f}%" if pred.get('two_week_low_prob') else '—'}
-"""
+            f"**향후 2주 최저점**\n"
+            f"- 예상일: {pred.get('two_week_low_date', '—')}\n"
+            f"- 예상가: {_fmt(pred.get('two_week_low_price'))}\n"
+            f"- 확률: {pred.get('two_week_low_prob', 0)*100:.0f}%"
         )
 
-    # ── 상승/하락 확률 & 신뢰도 ──────────────────────────────────────────────
-    st.markdown("#### 상승/하락 확률 & 신뢰도")
+    # 확률 & 신뢰도
     cp1, cp2, cp3 = st.columns(3)
     with cp1:
-        up = pred.get("up_probability", 50)
-        st.metric("상승 확률", f"{up:.1f}%")
+        st.metric("상승 확률", f"{pred.get('up_probability', 50):.1f}%")
     with cp2:
-        dn = pred.get("down_probability", 50)
-        st.metric("하락 확률", f"{dn:.1f}%")
+        st.metric("하락 확률", f"{pred.get('down_probability', 50):.1f}%")
     with cp3:
-        conf = pred.get("confidence_score", 0)
-        st.metric("신뢰도 점수", f"{conf:.1f}/100")
+        st.metric("신뢰도", f"{pred.get('confidence_score', 0):.1f}/100")
 
-    # ── 마이크론 feature 상세 ────────────────────────────────────────────────
-    with st.expander("마이크론 프리마켓 Feature 상세"):
-        feat_display = {
-            k: (f"{v:.4f}" if v is not None else "—")
-            for k, v in mu_features.items()
-        }
-        st.json(feat_display)
+    # 차트
+    st.markdown("#### 데이터 차트")
+    tab1min, tab3min, tabhy = st.tabs(["MU 1분봉", "MU 3분봉", "하이닉스 20일 일봉"])
+
+    with tab1min:
+        df_1min = None
+        if market_data.get("mu", {}).get("df_1min") is not None:
+            df_1min = market_data["mu"]["df_1min"]
+        elif _MICRON_1MIN.exists():
+            try:
+                df_1min = pd.read_csv(_MICRON_1MIN, parse_dates=["datetime"])
+            except Exception:
+                pass
+        if df_1min is not None and not df_1min.empty:
+            if "datetime" in df_1min.columns:
+                st.line_chart(df_1min.set_index("datetime")[["close"]])
+            else:
+                st.line_chart(df_1min[["close"]])
+            with st.expander("1분봉 데이터"):
+                st.dataframe(df_1min.tail(30), use_container_width=True)
+        else:
+            st.info("MU 1분봉 데이터 없음")
+
+    with tab3min:
+        df_3min = None
+        if market_data.get("mu", {}).get("df_3min") is not None:
+            df_3min = market_data["mu"]["df_3min"]
+        elif _MICRON_3MIN.exists():
+            try:
+                df_3min = pd.read_csv(_MICRON_3MIN, parse_dates=["datetime"])
+            except Exception:
+                pass
+        if df_3min is not None and not df_3min.empty:
+            idx_col = "datetime" if "datetime" in df_3min.columns else df_3min.columns[0]
+            st.line_chart(df_3min.set_index(idx_col)[["close"]])
+        else:
+            st.info("MU 3분봉 데이터 없음")
+
+    with tabhy:
+        df_hy = market_data.get("hynix", {}).get("df_daily")
+        if df_hy is not None and not df_hy.empty:
+            recent = df_hy.tail(20)
+            idx_col = "datetime" if "datetime" in recent.columns else recent.columns[0]
+            if idx_col in recent.columns:
+                st.line_chart(recent.set_index(idx_col)[["close"]])
+            st.dataframe(recent, use_container_width=True)
+        else:
+            st.info("하이닉스 일봉 데이터 없음")
 
     with st.expander("예측 신호 상세"):
         st.json(pred.get("signals", {}))
 
-st.divider()
+    st.divider()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 5: 예측 이력 & 적중률
+# 기술적 지표 표시
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.subheader("5. 예측 이력")
-
-if _log_ok:
-    try:
-        history = load_predictions()
-        if history:
-            df_hist = pd.DataFrame(history)
-            # 방향 적중률 계산 (actual 데이터 있는 행만)
-            completed = df_hist[
-                df_hist["actual_close"].apply(lambda x: bool(x and str(x).strip()))
-            ]
-            if not completed.empty:
-                try:
-                    correct = sum(
-                        (float(r["today_return_pct"]) >= 0) == (float(r["actual_close"]) >= float(r.get("actual_open") or r["actual_close"]))
-                        for _, r in completed.iterrows()
-                        if r["today_return_pct"] and r["actual_close"]
-                    )
-                    accuracy = correct / len(completed) * 100
-                    st.metric("최근 예측 방향 적중률", f"{accuracy:.1f}%", delta=f"{len(completed)}건 분석")
-                except Exception:
-                    pass
-
-            st.dataframe(
-                df_hist[["predicted_at", "today_return_pct", "confidence_score",
-                          "actual_close", "actual_open"]].tail(20),
-                use_container_width=True,
-            )
-        else:
-            st.info("예측 이력 없음")
-    except Exception as e:
-        st.warning(f"이력 로드 실패: {e}")
-else:
-    st.warning("예측 로거 모듈 로드 실패")
+tech = auto_feat.get("tech_indicators", {}) if auto_feat else {}
+if any(v is not None for v in tech.values()):
+    with st.expander("SK하이닉스 기술적 지표 (자동 계산)"):
+        ti_c1, ti_c2 = st.columns(2)
+        with ti_c1:
+            rsi = tech.get("rsi_14")
+            st.metric("RSI 14", f"{rsi:.1f}" if rsi is not None else "—",
+                      delta="과매도" if rsi and rsi < 30 else ("과매수" if rsi and rsi > 70 else None))
+            bb = tech.get("bollinger_pct")
+            st.metric("볼린저밴드 %B", f"{bb:.1f}%" if bb is not None else "—")
+            high_pct = tech.get("from_20d_high_pct")
+            st.metric("20일 고점 대비", f"{high_pct:.1f}%" if high_pct is not None else "—")
+        with ti_c2:
+            macd_cross = tech.get("macd_signal_cross")
+            cross_label = {1: "골든크로스 ▲", -1: "데드크로스 ▼", 0: "없음"}.get(macd_cross, "—")
+            st.metric("MACD 크로스", cross_label)
+            ma5 = tech.get("ma5_position_pct")
+            st.metric("5일선 대비 현재가", f"{ma5:+.1f}%" if ma5 is not None else "—")
+            vol_ch = tech.get("volume_change_pct")
+            st.metric("거래량 변화율", f"{vol_ch:+.1f}%" if vol_ch is not None else "—")
 
 st.divider()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 6: 현재 모델 가중치 & 자동 조정
+# 수동 보정 입력 (접힌 expander — 디버그/비상용)
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.subheader("6. 모델 가중치")
-
-if _adj_ok:
-    weights = load_weights()
-    wdf = pd.DataFrame(
-        [{"지표": k, "가중치": f"{v*100:.1f}%"} for k, v in weights.items()]
+with st.expander("수동 보정 입력 — 필요할 때만 사용", expanded=False):
+    st.caption(
+        "자동 수집에 실패했거나, 값을 직접 보정하고 싶을 때만 사용하세요. "
+        "'수동 예측 실행' 버튼을 누르면 이 값으로 예측이 재실행됩니다."
     )
-    st.dataframe(wdf, use_container_width=True, hide_index=True)
 
-    if st.button("가중치 자동 조정 실행"):
-        if _log_ok:
-            try:
-                history = load_predictions()
-                adj_result = adjust_weights_from_predictions(history)
-                new_w = adj_result["new_weights"]
-                save_weights(new_w, reason=adj_result["reason"])
-                st.success(f"가중치 조정 완료: {adj_result['reason']}")
-                changes = {k: f"{v*100:+.2f}%p" for k, v in adj_result.get("changes", {}).items() if v != 0}
-                if changes:
-                    st.json(changes)
-                else:
-                    st.info("변경 없음")
-            except Exception as exc:
-                st.error(f"가중치 조정 실패: {exc}")
-        else:
-            st.error("예측 로거 모듈 필요")
-else:
-    st.warning("가중치 조정 모듈 로드 실패")
+    m_c1, m_c2 = st.columns(2)
+    with m_c1:
+        m_klab_price  = st.number_input("코스피랩 예상가 (원)",          min_value=0.0,   value=0.0,  step=1000.0)
+        m_klab_ret    = st.number_input("코스피랩 예상 등락률 (%)",       min_value=-20.0, max_value=20.0, value=0.0, step=0.01)
+        m_prev_close  = st.number_input("SK하이닉스 전일 종가 (원)",      min_value=0.0,   value=0.0,  step=500.0)
+        m_prev_ret    = st.number_input("SK하이닉스 전일 등락률 (%)",     min_value=-30.0, max_value=30.0, value=0.0, step=0.01)
+    with m_c2:
+        m_sox  = st.number_input("SOX 등락률 (%)",    min_value=-15.0, max_value=15.0, value=0.0, step=0.01)
+        m_nvda = st.number_input("NVDA 등락률 (%)",   min_value=-20.0, max_value=20.0, value=0.0, step=0.01)
+        m_qqq  = st.number_input("QQQ 등락률 (%)",    min_value=-15.0, max_value=15.0, value=0.0, step=0.01)
+        m_usd  = st.number_input("USD/KRW 변화율 (%)", min_value=-5.0,  max_value=5.0,  value=0.0, step=0.01)
+
+    m_sub = st.expander("최근 수익률 / 기술적 지표 (선택)")
+    with m_sub:
+        ms_c1, ms_c2 = st.columns(2)
+        with ms_c1:
+            m_3d   = st.number_input("최근 3일 수익률 (%)",  value=0.0, step=0.01)
+            m_5d   = st.number_input("최근 5일 수익률 (%)",  value=0.0, step=0.01)
+            m_10d  = st.number_input("최근 10일 수익률 (%)", value=0.0, step=0.01)
+            m_vol  = st.number_input("거래량 변화율 (%)",    value=0.0, step=0.1)
+        with ms_c2:
+            m_rsi      = st.number_input("RSI 14",                  min_value=0.0,   max_value=100.0, value=50.0, step=0.1)
+            m_bb       = st.number_input("볼린저밴드 위치 (%)",      min_value=0.0,   max_value=150.0, value=50.0, step=1.0)
+            m_from_hi  = st.number_input("20일 고점 대비 위치 (%)", min_value=-50.0, max_value=0.0,   value=0.0,  step=0.5)
+            m_from_lo  = st.number_input("20일 저점 대비 위치 (%)", min_value=0.0,   max_value=100.0, value=0.0,  step=0.5)
+        m_macd_cross = st.selectbox("MACD 크로스", [("없음", 0), ("골든크로스 ▲", 1), ("데드크로스 ▼", -1)], format_func=lambda x: x[0])
+        m_candle     = st.selectbox("전일 캔들",   [("보통", 0), ("장대양봉 ▲", 1), ("장대음봉 ▼", -1)], format_func=lambda x: x[0])
+
+    manual_run = st.button("수동 예측 실행", use_container_width=True)
+
+    if manual_run and _pred_ok:
+        # 수동 MU feature는 세션에 저장된 자동 feature 재사용
+        mf = (auto_feat or {}).get("micron_features", {k: None for k in [
+            "micron_premarket_return", "micron_premarket_open_to_now",
+            "micron_premarket_high_to_now", "micron_premarket_low_to_now",
+            "micron_premarket_30m_momentum", "micron_premarket_60m_momentum",
+            "micron_premarket_vwap", "micron_premarket_volume_change",
+            "micron_regular_return", "micron_aftermarket_return",
+            "micron_session_strength_score",
+        ]})
+        _ti_m = {
+            "rsi_14":            m_rsi       if m_rsi      != 50.0 else None,
+            "bollinger_pct":     m_bb        if m_bb       != 50.0 else None,
+            "macd_signal_cross": m_macd_cross[1],
+            "prev_candle_type":  m_candle[1],
+            "from_20d_high_pct": m_from_hi   if m_from_hi  != 0.0  else None,
+            "from_20d_low_pct":  m_from_lo   if m_from_lo  != 0.0  else None,
+            "ma5_position_pct":  None,
+            "ma20_position_pct": None,
+            "ma60_position_pct": None,
+            "return_3d_pct":     m_3d        if m_3d       != 0.0  else None,
+            "return_5d_pct":     m_5d        if m_5d       != 0.0  else None,
+            "return_10d_pct":    m_10d       if m_10d      != 0.0  else None,
+            "volume_change_pct": m_vol       if m_vol      != 0.0  else None,
+            "macd": None,
+        }
+        try:
+            pred_m = predict_hynix(
+                micron_features=mf,
+                kospilab_expected_price=m_klab_price if m_klab_price > 0 else None,
+                kospilab_expected_return_pct=m_klab_ret if m_klab_ret != 0 else None,
+                sox_return_pct=m_sox if m_sox != 0 else None,
+                nvda_return_pct=m_nvda if m_nvda != 0 else None,
+                qqq_return_pct=m_qqq if m_qqq != 0 else None,
+                usd_krw_change_pct=m_usd if m_usd != 0 else None,
+                hynix_prev_close=m_prev_close if m_prev_close > 0 else None,
+                hynix_prev_return_pct=m_prev_ret if m_prev_ret != 0 else None,
+                hynix_return_3d_pct=m_3d if m_3d != 0 else None,
+                hynix_return_5d_pct=m_5d if m_5d != 0 else None,
+                hynix_return_10d_pct=m_10d if m_10d != 0 else None,
+                hynix_volume_change_pct=m_vol if m_vol != 0 else None,
+            )
+            st.session_state["hynix_pred"] = pred_m
+
+            if _swing_ok:
+                swing_m = evaluate_swing_flag(
+                    micron_features=mf,
+                    kospilab_expected_return_pct=m_klab_ret if m_klab_ret != 0 else None,
+                    tech_indicators=_ti_m,
+                    sox_return_pct=m_sox if m_sox != 0 else None,
+                    nvda_return_pct=m_nvda if m_nvda != 0 else None,
+                    qqq_return_pct=m_qqq if m_qqq != 0 else None,
+                    usd_krw_change_pct=m_usd if m_usd != 0 else None,
+                    hynix_prev_close=m_prev_close if m_prev_close > 0 else None,
+                    prediction=pred_m,
+                )
+                st.session_state["hynix_swing"] = swing_m
+                if _explain_ok:
+                    expl_m = generate_swing_explanation(
+                        swing_result=swing_m,
+                        micron_features=mf,
+                        tech_indicators=_ti_m,
+                        kospilab_return=m_klab_ret if m_klab_ret != 0 else None,
+                    )
+                    st.session_state["swing_explanation"] = expl_m
+
+            st.success("수동 예측 완료! 위 결과가 업데이트됩니다.")
+            st.rerun()
+        except Exception as me:
+            st.error(f"수동 예측 실패: {me}")
+
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 예측 이력 & 스윙 이력
+# ─────────────────────────────────────────────────────────────────────────────
+
+hist_tab, swing_hist_tab, weight_tab = st.tabs(["예측 이력", "스윙 이력", "모델 가중치"])
+
+with hist_tab:
+    if _log_ok:
+        try:
+            history = load_predictions()
+            if history:
+                df_hist = pd.DataFrame(history)
+                completed = df_hist[df_hist["actual_close"].apply(lambda x: bool(x and str(x).strip()))]
+                if not completed.empty:
+                    try:
+                        correct = sum(
+                            (float(r["today_return_pct"]) >= 0) == (
+                                float(r["actual_close"]) >= float(r.get("actual_open") or r["actual_close"])
+                            )
+                            for _, r in completed.iterrows()
+                            if r.get("today_return_pct") and r.get("actual_close")
+                        )
+                        accuracy = correct / len(completed) * 100
+                        st.metric("예측 방향 적중률", f"{accuracy:.1f}%", delta=f"{len(completed)}건")
+                    except Exception:
+                        pass
+                cols = ["predicted_at", "today_return_pct", "confidence_score", "actual_close"]
+                show = [c for c in cols if c in df_hist.columns]
+                st.dataframe(df_hist[show].tail(20), use_container_width=True)
+            else:
+                st.info("예측 이력 없음")
+        except Exception as e:
+            st.warning(f"이력 로드 실패: {e}")
+    else:
+        st.warning("예측 로거 모듈 로드 실패")
+
+with swing_hist_tab:
+    if _swing_log_ok:
+        try:
+            swing_hist = load_swing_flags()
+            if swing_hist:
+                df_sw = pd.DataFrame(swing_hist)
+                confirmed = df_sw[df_sw["flag_hit"].apply(lambda x: str(x) in ("0", "1"))]
+                if not confirmed.empty:
+                    hit_rate = confirmed["flag_hit"].apply(lambda x: int(str(x))).mean() * 100
+                    st.metric("플래그 적중률", f"{hit_rate:.1f}%", delta=f"{len(confirmed)}건")
+                show_cols = ["evaluated_at", "swing_flag", "flag_label", "swing_score",
+                             "confidence_score", "actual_return_3d", "flag_hit"]
+                avail = [c for c in show_cols if c in df_sw.columns]
+                st.dataframe(df_sw[avail].tail(20), use_container_width=True)
+            else:
+                st.info("스윙 플래그 이력 없음")
+        except Exception as e:
+            st.warning(f"스윙 이력 로드 실패: {e}")
+    else:
+        st.warning("스윙 로거 모듈 로드 실패")
+
+with weight_tab:
+    if _adj_ok:
+        wc1, wc2 = st.columns(2)
+        with wc1:
+            st.markdown("**가격 예측 모델 가중치**")
+            weights = load_weights()
+            wdf = pd.DataFrame([{"지표": k, "가중치": f"{v*100:.1f}%"} for k, v in weights.items()])
+            st.dataframe(wdf, use_container_width=True, hide_index=True)
+            if st.button("가중치 자동 조정", key="adj_pred"):
+                if _log_ok:
+                    try:
+                        adj = adjust_weights_from_predictions(load_predictions())
+                        save_weights(adj["new_weights"], reason=adj["reason"])
+                        st.success(f"조정: {adj['reason']}")
+                    except Exception as exc:
+                        st.error(str(exc))
+
+        with wc2:
+            st.markdown("**스윙 모델 가중치**")
+            sw_weights = load_swing_weights()
+            sw_labels = {
+                "micron_premarket": "마이크론 프리마켓",
+                "kospilab":         "코스피랩",
+                "tech_position":    "기술적 지표",
+                "volume_momentum":  "거래량/수급",
+                "semiconductor":    "반도체 지수",
+                "currency_risk":    "환율 리스크",
+            }
+            sw_df = pd.DataFrame([
+                {"지표": sw_labels.get(k, k), "가중치": f"{v*100:.1f}%"}
+                for k, v in sw_weights.items()
+            ])
+            st.dataframe(sw_df, use_container_width=True, hide_index=True)
+            if st.button("스윙 가중치 자동 조정", key="adj_swing"):
+                if _swing_log_ok:
+                    try:
+                        sadj = adjust_swing_weights_from_flags(load_swing_flags())
+                        save_swing_weights(sadj["new_weights"], reason=sadj["reason"])
+                        st.success(f"조정: {sadj['reason']}")
+                    except Exception as exc:
+                        st.error(str(exc))
+    else:
+        st.warning("가중치 조정 모듈 로드 실패")
 
 st.divider()
 st.caption(
-    "⚠️ 이 화면의 모든 예측 정보는 투자 참고용이며, "
-    "실제 매매 손익에 대한 책임은 전적으로 사용자에게 있습니다."
+    "이 페이지는 예측/분석 전용입니다. "
+    "실전 주문 기능과 연결되지 않습니다. "
+    "투자 참고용이며 실제 매매 책임은 사용자에게 있습니다."
 )
