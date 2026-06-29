@@ -485,7 +485,11 @@ def _compute_price_zones(
     ti: dict,
     prediction: Optional[dict],
 ) -> dict:
-    """목표가, 손절가, 매수/매도 구간 계산."""
+    """목표가, 손절가, 매수/매도 구간 계산.
+
+    매수 방향: target > base > stop_loss (stop_loss < target 보장)
+    매도 방향(long-only): target ≥ base > stop_loss (stop_loss < target 보장)
+    """
     empty = {
         "buy_zone_low": None, "buy_zone_high": None,
         "sell_zone_low": None, "sell_zone_high": None,
@@ -502,30 +506,37 @@ def _compute_price_zones(
     from_high = abs(ti.get("from_20d_high_pct") or 5.0)
     volatility = max(from_high * 0.3, 3.0)  # 최소 3%
 
-    # 리스크/리워드 = 2:1
-    if composite >= 0:  # 매수 방향
-        risk_pct   = min(volatility * 0.8, 7.0)    # 손절 ≤ 7%
+    def _r(p: Optional[float]) -> Optional[int]:
+        if p is None or p <= 0:
+            return None
+        unit = 500 if p < 500_000 else 1_000
+        return int(round(p / unit) * unit)
+
+    if composite >= 0:  # 매수 방향: target > base > stop_loss
+        risk_pct   = min(volatility * 0.8, 7.0)
         reward_pct = risk_pct * 2.0
         buy_low    = base * (1 - volatility * 0.005)
         buy_high   = base * (1 + volatility * 0.003)
-        target     = base * (1 + reward_pct / 100)
-        stop_loss  = base * (1 - risk_pct / 100)
+        target     = base * (1 + reward_pct / 100)   # base 위 → target > base
+        stop_loss  = base * (1 - risk_pct / 100)     # base 아래 → stop_loss < base
         sell_low   = target * 0.99
         sell_high  = target * 1.01
-    else:  # 매도 방향
+    else:  # 매도 방향 (long-only 투자자 기준): target ≥ base > stop_loss
         risk_pct   = min(volatility * 0.8, 7.0)
-        reward_pct = risk_pct * 2.0
-        sell_low   = base * (1 - volatility * 0.003)
-        sell_high  = base * (1 + volatility * 0.005)
-        target     = base * (1 - reward_pct / 100)
-        stop_loss  = base * (1 + risk_pct / 100)
-        buy_low    = target * 0.99
-        buy_high   = target * 1.01
+        # 목표가: 현재가 부근 또는 소폭 위 (리바운드 시 청산 목표)
+        reward_pct = risk_pct * 0.5
+        sell_low   = base * (1 - volatility * 0.005)   # 매도 구간 하단 (현재가 아래)
+        sell_high  = base * (1 + volatility * 0.003)   # 매도 구간 상단 (현재가 위)
+        target     = base * (1 + reward_pct / 100)     # 목표가 = 현재가 위 (리바운드 청산)
+        stop_loss  = base * (1 - risk_pct / 100)       # 손절가 = 현재가 아래 (강제 손절)
+        # 매도 방향에서 재매수 구간은 제공하지 않음
+        buy_low    = None
+        buy_high   = None
 
-    def _r(p: float) -> int:
-        if p < 500_000: unit = 500
-        else:           unit = 1_000
-        return int(round(p / unit) * unit)
+    # 논리 검증: stop_loss < target 보장
+    if target is not None and stop_loss is not None and stop_loss >= target:
+        # 계산 오류 안전망: stop_loss를 target 아래로 강제 조정
+        stop_loss = target * 0.93
 
     return {
         "buy_zone_low":    _r(buy_low),

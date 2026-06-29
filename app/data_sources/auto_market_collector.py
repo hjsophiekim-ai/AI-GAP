@@ -23,6 +23,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+try:
+    from app.data.market_data_validator import validate_hynix_dataframe
+    _HYNIX_VALIDATOR_OK = True
+except ImportError:
+    _HYNIX_VALIDATOR_OK = False
+
+    def validate_hynix_dataframe(df):  # type: ignore[misc]
+        if df is None or df.empty:
+            return False, "데이터 없음", df
+        valid = df[df["close"].apply(lambda x: 50_000 <= x <= 1_000_000)].reset_index(drop=True)
+        return (len(valid) >= 20, f"유효 행: {len(valid)}", valid)
+
 _ROOT = Path(__file__).resolve().parent.parent.parent
 _MICRON_DIR = _ROOT / "data" / "micron"
 _HYNIX_DIR  = _ROOT / "data" / "hynix"
@@ -225,13 +237,17 @@ def collect_hynix_daily(mode: Optional[str] = None, n_days: int = 70) -> dict:
         try:
             df_kis = _fetch_hynix_daily_from_kis(mode, n_days)
             if df_kis is not None and not df_kis.empty:
-                _save_hynix_daily(df_kis)
-                result.update(
-                    df_daily=df_kis,
-                    prev_close=float(df_kis.iloc[-1]["close"]),
-                    source="kis",
-                )
-                return result
+                valid, msg, df_kis = validate_hynix_dataframe(df_kis)
+                if valid:
+                    _save_hynix_daily(df_kis)
+                    result.update(
+                        df_daily=df_kis,
+                        prev_close=float(df_kis.iloc[-1]["close"]),
+                        source="kis",
+                    )
+                    return result
+                else:
+                    result["error"] = f"KIS 하이닉스 일봉 검증 실패: {msg}"
         except Exception as e:
             result["error"] = f"KIS 하이닉스 일봉 실패: {e}"
 
@@ -239,12 +255,18 @@ def collect_hynix_daily(mode: Optional[str] = None, n_days: int = 70) -> dict:
     try:
         import yfinance as yf
         ticker = yf.Ticker("000660.KS")
-        hist = ticker.history(period=f"{n_days + 10}d", interval="1d")
+        hist = ticker.history(period=f"{n_days + 30}d", interval="1d", auto_adjust=True)
         if not hist.empty:
             df = _normalize_yf_ohlcv(hist)
-            _save_hynix_daily(df)
-            result.update(df_daily=df, prev_close=float(df.iloc[-1]["close"]), source="yfinance")
-            return result
+            valid, msg, df = validate_hynix_dataframe(df)
+            if valid:
+                _save_hynix_daily(df)
+                result.update(df_daily=df, prev_close=float(df.iloc[-1]["close"]), source="yfinance")
+                return result
+            else:
+                result["error"] = (result.get("error") or "") + f" | yfinance 하이닉스 검증 실패: {msg}"
+        else:
+            result["error"] = (result.get("error") or "") + " | yfinance 하이닉스 빈 응답"
     except Exception as e:
         result["error"] = (result.get("error") or "") + f" | yfinance 하이닉스 실패: {e}"
 
@@ -252,10 +274,15 @@ def collect_hynix_daily(mode: Optional[str] = None, n_days: int = 70) -> dict:
     if _HYNIX_DAILY_CSV.exists():
         try:
             df = pd.read_csv(_HYNIX_DAILY_CSV)
-            result.update(df_daily=df, prev_close=float(df.iloc[-1]["close"]), source="cache")
-            result["error"] = (result.get("error") or "") + " | 캐시 사용"
-        except Exception:
-            pass
+            if "close" in df.columns and not df.empty:
+                valid, msg, df = validate_hynix_dataframe(df)
+                if valid:
+                    result.update(df_daily=df, prev_close=float(df.iloc[-1]["close"]), source="cache")
+                    result["error"] = (result.get("error") or "") + " | 캐시 사용"
+                else:
+                    result["error"] = (result.get("error") or "") + f" | 캐시 검증 실패: {msg}"
+        except Exception as ce:
+            result["error"] = (result.get("error") or "") + f" | 캐시 로드 실패: {ce}"
 
     return result
 

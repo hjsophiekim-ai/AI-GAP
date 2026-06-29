@@ -232,6 +232,30 @@ if auto_run:
         else:
             st.success(f"🟢 **데이터 수집률 {rate_pct} ({rate_label})** — 예측 완료")
 
+        # ── 데이터 진단 (상단 고정 섹션) ────────────────────────────────────
+        st.subheader("데이터 진단")
+        diag = engine_result.get("diagnostics", {})
+        _diag_sources = [
+            ("MU 현재가",      diag.get("mu", {})),
+            ("NVDA 현재가",    diag.get("nvda", {})),
+            ("SOX 지수",       diag.get("sox", {})),
+            ("QQQ ETF",        diag.get("qqq", {})),
+            ("USD/KRW",        diag.get("usdkrw", {})),
+            ("하이닉스 일봉",  diag.get("hynix", {})),
+            ("코스피랩",       diag.get("kospilab", {})),
+        ]
+        diag_cols = st.columns(len(_diag_sources))
+        for col, (name, src_info) in zip(diag_cols, _diag_sources):
+            ok = src_info.get("ok", False)
+            icon = "✅" if ok else "❌"
+            src  = src_info.get("source") or src_info.get("status") or "—"
+            err  = src_info.get("error") or ""
+            with col:
+                st.markdown(f"**{icon} {name}**")
+                st.caption(src)
+                if not ok and err:
+                    st.caption(f"⚠ {str(err)[:50]}")
+
         # 수집 오류 상세
         all_errors = engine_result.get("errors", []) + market_data.get("errors", [])
         if all_errors:
@@ -316,37 +340,59 @@ if swing is not None and _swing_ok:
     cf          = swing.get("confidence_score", 0.0)
     action_text = swing.get("action_text", "—")
 
+    # 신뢰도 게이트 (confidence < 40 → 추천 차단)
+    _engine_result = st.session_state.get("engine_result", {})
+    _confidence_blocked = _engine_result.get("confidence_blocked", cf < 40.0)
+
     st.subheader("스윙 매매 플래그")
 
-    # ── 핵심 카드: 플래그 + 액션 + 신뢰도 ───────────────────────────────────
-    st.markdown(
-        f"""<div style="background:{flag_color};color:#fff;padding:18px 28px;
+    if _confidence_blocked:
+        st.warning(
+            f"⚠️ **신뢰도 {cf:.0f}/100 — 데이터 부족/저신뢰**\n\n"
+            "수집된 데이터가 매매 추천을 내리기에 충분하지 않습니다. "
+            "시장 데이터를 재수집하거나 수동 입력을 활용하세요.",
+        )
+        # 신뢰도 차단 상태에서는 플래그 카드를 흐리게 표시 (참고용)
+        st.markdown(
+            f"""<div style="background:#7f8c8d;color:#fff;padding:14px 24px;
+border-radius:12px;text-align:center;margin-bottom:12px;opacity:0.55;">
+  <div style="font-size:0.9rem;opacity:0.80;margin-bottom:2px;">참고용 (신뢰도 부족)</div>
+  <div style="font-size:1.8rem;font-weight:bold;margin:4px 0;">{flag_label}</div>
+  <div style="font-size:0.80rem;opacity:0.70;">Swing Score {score:.0f}/100 · 신뢰도 {cf:.0f}/100</div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        # ── 핵심 카드: 플래그 + 액션 + 신뢰도 ───────────────────────────────────
+        st.markdown(
+            f"""<div style="background:{flag_color};color:#fff;padding:18px 28px;
 border-radius:12px;text-align:center;margin-bottom:12px;">
   <div style="font-size:1.0rem;opacity:0.88;margin-bottom:2px;">현재 플래그 · Swing Score {score:.0f}/100</div>
   <div style="font-size:2.4rem;font-weight:bold;margin:6px 0;">{flag_label}</div>
   <div style="font-size:1.15rem;font-weight:600;margin:8px 0;opacity:0.97;">{action_text}</div>
   <div style="font-size:0.80rem;opacity:0.78;">신뢰도 {cf:.0f}/100 · {flag_val}</div>
 </div>""",
-        unsafe_allow_html=True,
-    )
+            unsafe_allow_html=True,
+        )
 
-    # ── 구체적 매매 타이밍 ────────────────────────────────────────────────────
-    buy_txt    = swing.get("buy_timing_text")
-    sell_txt   = swing.get("sell_timing_text")
-    bot_win    = swing.get("bottom_window_text")
-    top_win    = swing.get("top_window_text")
+    # ── 구체적 매매 타이밍 (신뢰도 충분할 때만) ──────────────────────────────
+    if not _confidence_blocked:
+        buy_txt    = swing.get("buy_timing_text")
+        sell_txt   = swing.get("sell_timing_text")
+        bot_win    = swing.get("bottom_window_text")
+        top_win    = swing.get("top_window_text")
 
-    timing_lines = []
-    if buy_txt:
-        timing_lines.append(f"📥 **매수 타이밍:** {buy_txt}")
-    if sell_txt:
-        timing_lines.append(f"📤 **매도 타이밍:** {sell_txt}")
-    if bot_win:
-        timing_lines.append(f"🔵 **저점 예상:** {bot_win}")
-    if top_win:
-        timing_lines.append(f"🔴 **고점 예상:** {top_win}")
-    if timing_lines:
-        st.markdown("  \n".join(timing_lines))
+        timing_lines = []
+        if buy_txt:
+            timing_lines.append(f"📥 **매수 타이밍:** {buy_txt}")
+        if sell_txt:
+            timing_lines.append(f"📤 **매도 타이밍:** {sell_txt}")
+        if bot_win:
+            timing_lines.append(f"🔵 **저점 예상:** {bot_win}")
+        if top_win:
+            timing_lines.append(f"🔴 **고점 예상:** {top_win}")
+        if timing_lines:
+            st.markdown("  \n".join(timing_lines))
 
     # ── 확률 & 신뢰도 ─────────────────────────────────────────────────────────
     sw1, sw2, sw3 = st.columns(3)

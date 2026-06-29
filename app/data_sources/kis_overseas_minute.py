@@ -21,6 +21,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+try:
+    from app.data.market_data_validator import parse_mu_price_str, validate_mu_price, auto_fix_mu_price
+    _VALIDATOR_OK = True
+except ImportError:
+    _VALIDATOR_OK = False
+
+    def parse_mu_price_str(raw):  # type: ignore[misc]
+        if raw is None:
+            return None
+        try:
+            val = float(str(raw).replace(",", "").strip())
+            if val <= 0:
+                return None
+            if 20 <= val <= 500:
+                return val
+            for div in (10, 100):
+                fixed = val / div
+                if 20 <= fixed <= 500:
+                    return fixed
+            return None
+        except Exception:
+            return None
+
 _ROOT = Path(__file__).resolve().parent.parent.parent
 _MICRON_DIR = _ROOT / "data" / "micron"
 _TOKEN_CACHE_DIR = _ROOT / "data" / "cache"
@@ -190,11 +213,14 @@ def fetch_mu_current_price(mode: str = "real") -> Optional[dict]:
         output = resp.json().get("output", {})
         if not output:
             return None
+        price = parse_mu_price_str(output.get("last"))
+        if price is None:
+            return None  # 가격 범위 검증 실패 또는 파싱 불가
         return {
-            "price":     float(output.get("last", 0) or 0),
-            "open":      float(output.get("open", 0) or 0),
-            "high":      float(output.get("high", 0) or 0),
-            "low":       float(output.get("low", 0) or 0),
+            "price":     price,
+            "open":      parse_mu_price_str(output.get("open")) or price,
+            "high":      parse_mu_price_str(output.get("high")) or price,
+            "low":       parse_mu_price_str(output.get("low")) or price,
             "volume":    int(output.get("tvol", 0) or 0),
             "symbol":    "MU",
             "timestamp": datetime.now().isoformat(),
@@ -256,12 +282,15 @@ def fetch_mu_1min_bars(
                 continue
             try:
                 dt = datetime.strptime(date_str + time_str, "%Y%m%d%H%M%S")
+                close_px = parse_mu_price_str(item.get("last"))
+                if close_px is None:
+                    continue  # 가격 범위 오류인 봉은 건너뜀
                 rows.append({
                     "datetime": dt,
-                    "open":     float(item.get("open", 0) or 0),
-                    "high":     float(item.get("high", 0) or 0),
-                    "low":      float(item.get("low", 0) or 0),
-                    "close":    float(item.get("last", 0) or 0),
+                    "open":     parse_mu_price_str(item.get("open")) or close_px,
+                    "high":     parse_mu_price_str(item.get("high")) or close_px,
+                    "low":      parse_mu_price_str(item.get("low")) or close_px,
+                    "close":    close_px,
                     "volume":   int(item.get("evol", 0) or 0),
                 })
             except Exception:
