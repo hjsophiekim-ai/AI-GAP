@@ -1,14 +1,10 @@
-"""
-naver_stock_collector.py — 네이버 금융 국내주식 수집.
-
-SK하이닉스(000660) 현재가·일별시세 스크래핑.
-수집 우선순위 상 KIS 다음, yfinance 이전 2순위로 사용.
-"""
+"""Naver Finance collector for Korean equities."""
 
 from __future__ import annotations
 
 import logging
 import re
+from io import StringIO
 from typing import Optional
 
 import pandas as pd
@@ -16,169 +12,181 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_HYNIX_CODE = "000660"
-_HYNIX_PRICE_MIN = 50_000
-_HYNIX_PRICE_MAX = 1_000_000
-_HEADERS = {
+HYNIX_CODE = "000660"
+HYNIX_PRICE_MIN = 50_000
+HYNIX_PRICE_MAX = 5_000_000
+
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "Referer": "https://finance.naver.com/",
-    "Accept-Language": "ko-KR,ko;q=0.9",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
 
-def _is_valid_hynix_price(price: float) -> bool:
-    return _HYNIX_PRICE_MIN <= price <= _HYNIX_PRICE_MAX
+def _valid_hynix_price(price: object) -> bool:
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return False
+    return HYNIX_PRICE_MIN <= value <= HYNIX_PRICE_MAX
 
 
-def fetch_naver_current_price(code: str = _HYNIX_CODE) -> dict:
-    """
-    네이버 금융에서 종목 현재가 수집.
+def _decode_response(response: requests.Response) -> str:
+    response.encoding = "euc-kr"
+    text = response.text
+    if not text or "\ufffd" in text[:500]:
+        response.encoding = response.apparent_encoding or "euc-kr"
+        text = response.text
+    return text
 
-    Returns
-    -------
-    dict: {current_price, source, status, error}
-    """
-    result: dict = {
+
+def _to_number(value: object) -> Optional[float]:
+    if value is None or pd.isna(value):
+        return None
+    cleaned = re.sub(r"[^\d.\-]", "", str(value))
+    if cleaned in ("", "-", "."):
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def fetch_naver_current_price(code: str = HYNIX_CODE) -> dict:
+    """Fetch current price from Naver Finance."""
+    result = {
+        "code": code,
         "current_price": None,
         "source": "naver",
         "status": "failed",
         "error": None,
     }
-    try:
-        url = f"https://finance.naver.com/item/sise.naver?code={code}"
-        resp = requests.get(url, headers=_HEADERS, timeout=10)
-        resp.raise_for_status()
-        resp.encoding = "euc-kr"
-        text = resp.text
 
-        price = None
-        for pattern in [
-            r'id="current_value"[^>]*>\s*([\d,]+)',
-            r'class="no_today"[^>]*>\s*<em[^>]*>([^<]+)</em>',
-            r'"currentPrice"\s*:\s*"?([\d,]+)',
-            r'<strong[^>]*class="[^"]*num[^"]*"[^>]*>\s*([\d,]+)',
-        ]:
-            m = re.search(pattern, text)
-            if m:
-                try:
-                    price = float(m.group(1).replace(",", ""))
-                    if _is_valid_hynix_price(price):
-                        break
-                    price = None
-                except ValueError:
-                    price = None
+    try:
+        url = f"https://finance.naver.com/item/main.naver?code={code}"
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        text = _decode_response(response)
+
+        price: Optional[float] = None
+        patterns = [
+            r'<p[^>]+class="no_today"[^>]*>.*?<span[^>]+class="blind"[^>]*>([\d,]+)</span>',
+            r'id="_nowVal"[^>]*>([\d,]+)',
+            r"현재가\s*</th>\s*<td[^>]*>\s*<em[^>]*>\s*<span[^>]*>([\d,]+)</span>",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.DOTALL)
+            if not match:
+                continue
+            parsed = _to_number(match.group(1))
+            if parsed is not None:
+                price = parsed
+                break
 
         if price is None:
             daily = fetch_naver_daily_ohlcv(code, pages=1)
             if daily is not None and not daily.empty:
                 price = float(daily.iloc[-1]["close"])
-                if not _is_valid_hynix_price(price):
-                    price = None
 
-        if price is not None:
-            result["current_price"] = price
-            result["status"] = "success"
-        else:
-            result["error"] = "가격 파싱 실패 (범위 밖 또는 패턴 불일치)"
+        if not _valid_hynix_price(price):
+            result["error"] = "invalid_price"
+            return result
+
+        result.update(current_price=float(price), status="success")
+        return result
     except Exception as exc:
-        result["error"] = f"네이버 현재가 수집 오류: {exc}"
-        logger.warning("naver_current_price 수집 실패: %s", exc)
+        logger.warning("Naver current price failed for %s: %s", code, exc)
+        result["error"] = str(exc)
+        return result
 
-    return result
+
+def fetch_hynix_current_price() -> dict:
+    """Convenience wrapper for SK Hynix."""
+    return fetch_naver_current_price(HYNIX_CODE)
 
 
-def fetch_naver_daily_ohlcv(code: str = _HYNIX_CODE, pages: int = 3) -> Optional[pd.DataFrame]:
+def fetch_naver_daily_ohlcv(code: str = HYNIX_CODE, pages: int = 3) -> Optional[pd.DataFrame]:
+    """Fetch daily OHLCV rows from Naver Finance.
+
+    Returns a DataFrame with date, datetime, open, high, low, close, volume.
     """
-    네이버 금융 일별시세 수집.
+    records: list[dict] = []
 
-    Parameters
-    ----------
-    code  : 종목 코드
-    pages : 수집할 페이지 수 (1페이지 ≈ 10~15거래일)
-
-    Returns
-    -------
-    pd.DataFrame with columns [datetime, open, high, low, close, volume]
-    or None on failure.
-    """
-    records = []
     for page in range(1, pages + 1):
-        url = f"https://finance.naver.com/item/sise_day.naver?code={code}&page={page}"
         try:
-            resp = requests.get(url, headers=_HEADERS, timeout=10)
-            resp.raise_for_status()
-            resp.encoding = "euc-kr"
-
-            tables = pd.read_html(resp.text, header=0)
-            if not tables:
-                continue
-
-            df = None
-            for t in tables:
-                t.columns = [str(c).strip() for c in t.columns]
-                if any("날짜" in c or "일자" in c for c in t.columns):
-                    df = t
-                    break
-            if df is None:
-                continue
-
-            col_map: dict = {}
-            for c in df.columns:
-                lc = c.strip()
-                if "날짜" in lc or "일자" in lc:
-                    col_map[c] = "date"
-                elif "종가" in lc:
-                    col_map[c] = "close"
-                elif "시가" in lc:
-                    col_map[c] = "open"
-                elif "고가" in lc:
-                    col_map[c] = "high"
-                elif "저가" in lc:
-                    col_map[c] = "low"
-                elif "거래량" in lc:
-                    col_map[c] = "volume"
-            df = df.rename(columns=col_map)
-
-            needed = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
-            if "date" not in needed or "close" not in needed:
-                continue
-            df = df[needed].dropna(subset=["date", "close"])
-
-            for _, row in df.iterrows():
-                try:
-                    date_str = str(row["date"]).strip()
-                    if not re.match(r"\d{4}\.\d{2}\.\d{2}", date_str):
-                        continue
-                    close_raw = str(row["close"]).replace(",", "").strip()
-                    close = float(close_raw)
-                    if not _is_valid_hynix_price(close):
-                        continue
-                    open_raw = str(row.get("open", close)).replace(",", "").strip()
-                    high_raw = str(row.get("high", close)).replace(",", "").strip()
-                    low_raw  = str(row.get("low", close)).replace(",", "").strip()
-                    vol_raw  = str(row.get("volume", 0)).replace(",", "").strip()
-                    records.append({
-                        "datetime": date_str,
-                        "open":   float(open_raw or close),
-                        "high":   float(high_raw or close),
-                        "low":    float(low_raw or close),
-                        "close":  close,
-                        "volume": int(float(vol_raw or 0)),
-                    })
-                except (ValueError, TypeError):
-                    continue
+            url = f"https://finance.naver.com/item/sise_day.naver?code={code}&page={page}"
+            response = requests.get(url, headers=HEADERS, timeout=10)
+            response.raise_for_status()
+            html = _decode_response(response)
+            tables = pd.read_html(StringIO(html), header=0)
         except Exception as exc:
-            logger.debug("네이버 일봉 page=%d 수집 실패: %s", page, exc)
+            logger.debug("Naver daily page %s failed for %s: %s", page, code, exc)
             continue
+
+        for table in tables:
+            if table.empty:
+                continue
+            table = table.dropna(how="all")
+            table.columns = [str(col).strip() for col in table.columns]
+
+            col_map: dict[str, str] = {}
+            for col in table.columns:
+                name = str(col).strip()
+                if name in ("날짜", "일자"):
+                    col_map[col] = "date"
+                elif name == "종가":
+                    col_map[col] = "close"
+                elif name == "시가":
+                    col_map[col] = "open"
+                elif name == "고가":
+                    col_map[col] = "high"
+                elif name == "저가":
+                    col_map[col] = "low"
+                elif name == "거래량":
+                    col_map[col] = "volume"
+
+            normalized = table.rename(columns=col_map)
+            if not {"date", "close"}.issubset(normalized.columns):
+                continue
+
+            for _, row in normalized.iterrows():
+                date_text = str(row.get("date", "")).strip()
+                if not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", date_text):
+                    continue
+
+                close = _to_number(row.get("close"))
+                if not _valid_hynix_price(close):
+                    continue
+
+                open_price = _to_number(row.get("open")) or close
+                high = _to_number(row.get("high")) or close
+                low = _to_number(row.get("low")) or close
+                volume = _to_number(row.get("volume")) or 0
+
+                records.append(
+                    {
+                        "date": date_text,
+                        "datetime": pd.to_datetime(date_text, format="%Y.%m.%d", errors="coerce"),
+                        "open": float(open_price),
+                        "high": float(high),
+                        "low": float(low),
+                        "close": float(close),
+                        "volume": int(volume),
+                    }
+                )
 
     if not records:
         return None
 
-    result = pd.DataFrame(records)
-    result["datetime"] = pd.to_datetime(result["datetime"], format="%Y.%m.%d", errors="coerce")
-    result = result.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
-    return result if not result.empty else None
+    df = pd.DataFrame(records).dropna(subset=["datetime"])
+    df = df.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+    return df[["date", "datetime", "open", "high", "low", "close", "volume"]] if not df.empty else None
+
+
+def fetch_hynix_daily_ohlcv(pages: int = 3) -> Optional[pd.DataFrame]:
+    """Convenience wrapper for SK Hynix daily candles."""
+    return fetch_naver_daily_ohlcv(HYNIX_CODE, pages=pages)

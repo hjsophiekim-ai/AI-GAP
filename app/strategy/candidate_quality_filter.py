@@ -314,7 +314,7 @@ class CandidateQualityFilter:
 
         # 시초가 대비 낙폭 하드 제외 (기본 50% 이상 하락)
         max_drop_from_open = float(qcfg.get("max_drop_from_open_rate", 50.0))
-        if c.open > 0 and max_drop_from_open > 0:
+        if c.open > 0 and max_drop_from_open > 0 and c.current_price * 0.5 <= c.open <= c.current_price * 2.0:
             drop_from_open = (c.current_price - c.open) / c.open * 100.0
             if drop_from_open <= -max_drop_from_open:
                 return f"시초가대비낙폭({drop_from_open:.1f}% ≤ -{max_drop_from_open}%)"

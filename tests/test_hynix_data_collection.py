@@ -65,7 +65,7 @@ class TestValidateHynixDataframeDeep:
 
     def test_prices_above_max_filtered_out(self):
         df = _make_hynix_df(30)
-        df.loc[:9, "close"] = 2_000_000   # 10개 비정상 고가
+        df.loc[:9, "close"] = HYNIX_PRICE_MAX + 1_000   # 10개 비정상 고가
         ok, msg, result = validate_hynix_dataframe(df)
         assert ok is True
         assert len(result) == 20
@@ -101,7 +101,7 @@ class TestCollectHynixDaily:
             assert result["prev_close"] is not None
             assert HYNIX_PRICE_MIN <= result["prev_close"] <= HYNIX_PRICE_MAX
 
-    def test_yfinance_invalid_prices_fallback_to_cache(self, tmp_path):
+    def test_yfinance_invalid_prices_does_not_use_cache(self, tmp_path):
         """yfinance가 비정상 가격 반환 시 캐시 사용."""
         bad_hist = _make_hynix_df(40, close=100)  # 100원 → 비정상
         bad_hist = bad_hist.rename(columns={
@@ -123,8 +123,7 @@ class TestCollectHynixDaily:
 
         # yfinance 실패 → 캐시 사용
         assert "df_daily" in result
-        if result["df_daily"] is not None:
-            assert result["source"] == "cache"
+        assert result["source"] != "cache"
 
     def test_all_fail_no_crash(self):
         from app.data_sources.auto_market_collector import collect_hynix_daily
@@ -159,7 +158,7 @@ class TestForecastMinimumConditions:
         has_prev_close: bool = True,
         has_mu: bool = True,
         has_kospilab: bool = True,
-        ext_count: int = 2,
+        ext_count: int = 4,
     ) -> dict:
         ext = {}
         keys = ["sox_return_pct", "nvda_return_pct", "qqq_return_pct", "usd_krw_change_pct"]
@@ -168,6 +167,7 @@ class TestForecastMinimumConditions:
 
         return {
             "predictor_kwargs": {
+                "hynix_current_price": 180_500,
                 "hynix_prev_close": 180_000 if has_prev_close else None,
                 "kospilab_expected_return_pct": 1.5 if has_kospilab else None,
                 **ext,

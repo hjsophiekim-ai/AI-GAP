@@ -59,6 +59,7 @@ def build_auto_features(market_data: dict) -> dict:
     # ── SK하이닉스 기술적 지표 ────────────────────────────────────────────────
     df_daily   = hynix_data.get("df_daily")
     prev_close = hynix_data.get("prev_close")
+    current_price = hynix_data.get("current_price")
     tech_indicators = _build_tech_indicators(df_daily)
 
     # ── predict_hynix 추가 인자 ───────────────────────────────────────────────
@@ -70,6 +71,7 @@ def build_auto_features(market_data: dict) -> dict:
         "qqq_return_pct":               qqq_return,
         "usd_krw_change_pct":           usdkrw_change,
         "hynix_prev_close":             prev_close,
+        "hynix_current_price":           current_price,
         "hynix_prev_return_pct":        tech_indicators.get("return_3d_pct"),
         "hynix_return_3d_pct":          tech_indicators.get("return_3d_pct"),
         "hynix_return_5d_pct":          tech_indicators.get("return_5d_pct"),
@@ -86,6 +88,7 @@ def build_auto_features(market_data: dict) -> dict:
         "qqq_return_pct":               qqq_return,
         "usd_krw_change_pct":           usdkrw_change,
         "hynix_prev_close":             prev_close,
+        "hynix_current_price":           current_price,
     }
 
     # ── 데이터 품질 점수 ─────────────────────────────────────────────────────
@@ -97,6 +100,8 @@ def build_auto_features(market_data: dict) -> dict:
         "swing_kwargs":      swing_kwargs,
         "tech_indicators":   tech_indicators,
         "hynix_prev_close":  prev_close,
+        "hynix_current_price": current_price,
+        "hynix_daily_count": 0 if df_daily is None else len(df_daily),
         "kospilab_return":   klab_ret,
         "data_quality":      quality,
         "sources": {
@@ -138,6 +143,7 @@ def _build_tech_indicators(df_daily: Optional[pd.DataFrame]) -> dict:
         "ma20_position_pct", "ma60_position_pct", "from_20d_high_pct",
         "from_20d_low_pct", "bollinger_pct", "prev_candle_type",
         "return_3d_pct", "return_5d_pct", "return_10d_pct", "volume_change_pct",
+        "atr_14_pct",
     ]}
     if df_daily is None or df_daily.empty:
         return empty

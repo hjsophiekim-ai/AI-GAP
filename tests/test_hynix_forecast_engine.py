@@ -33,17 +33,26 @@ def _make_daily_df(n: int = 70) -> pd.DataFrame:
 def _full_market_data() -> dict:
     mu_df = pd.DataFrame({
         "datetime": pd.date_range("2026-06-29 17:00", periods=60, freq="1min"),
-        "open":  [101.5] * 60,
-        "high":  [103.0] * 60,
-        "low":   [100.5] * 60,
-        "close": [102.0] * 60,
-        "volume": [80_000] * 60,
+        "open":  [101.5 + i * 0.01 for i in range(60)],
+        "high":  [103.0 + i * 0.01 for i in range(60)],
+        "low":   [100.5 + i * 0.01 for i in range(60)],
+        "close": [102.0 + i * 0.01 for i in range(60)],
+        "volume": [80_000 + i for i in range(60)],
         "session": ["premarket"] * 60,
+    })
+    mu_daily = pd.DataFrame({
+        "datetime": pd.date_range("2026-05-01", periods=30, freq="B"),
+        "open": [100 + i * 0.1 for i in range(30)],
+        "high": [101 + i * 0.1 for i in range(30)],
+        "low": [99 + i * 0.1 for i in range(30)],
+        "close": [100 + i * 0.1 for i in range(30)],
+        "volume": [1_000_000 + i for i in range(30)],
     })
     return {
         "mu": {
             "df_1min":      mu_df,
-            "df_3min":      None,
+            "df_3min":      mu_df.iloc[::3].reset_index(drop=True),
+            "df_daily":     mu_daily,
             "current_price": {"price": 102.0, "open": 101.5, "high": 103.0, "low": 100.5},
             "source":       "yfinance",
             "error":        None,
@@ -65,7 +74,17 @@ def _full_market_data() -> dict:
         "hynix": {
             "df_daily":  _make_daily_df(),
             "prev_close": 195_000.0,
+            "current_price": 195_500.0,
             "source":    "yfinance",
+            "stock_identity": {"code": "000660", "name": "SK하이닉스", "ok": True, "message": "ok"},
+            "price_validation": {
+                "ok": True,
+                "message": "ok",
+                "source_prices": {"KIS": 195_500.0, "naver": 195_600.0, "yfinance": 195_400.0},
+                "selected_source": "KIS",
+                "selected_price": 195_500.0,
+                "max_diff_pct": 0.1024,
+            },
             "error":     None,
         },
         "kospilab": {

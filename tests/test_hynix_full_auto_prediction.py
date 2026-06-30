@@ -211,16 +211,25 @@ class TestMinuteBarsResample:
         from app.data_sources.auto_market_collector import collect_mu_data
         mu_df = pd.DataFrame({
             "datetime": pd.date_range("2026-06-29 17:00", periods=30, freq="1min"),
-            "open":   [100.0] * 30,
-            "high":   [101.0] * 30,
-            "low":    [99.0]  * 30,
-            "close":  [100.5] * 30,
-            "volume": [50_000] * 30,
+            "open":   [100.0 + i * 0.02 for i in range(30)],
+            "high":   [101.0 + i * 0.02 for i in range(30)],
+            "low":    [99.0 + i * 0.02 for i in range(30)],
+            "close":  [100.5 + i * 0.02 for i in range(30)],
+            "volume": [50_000 + i for i in range(30)],
+        })
+        mu_daily = pd.DataFrame({
+            "datetime": pd.date_range("2026-05-01", periods=30, freq="B"),
+            "open": [100.0 + i * 0.1 for i in range(30)],
+            "high": [101.0 + i * 0.1 for i in range(30)],
+            "low": [99.0 + i * 0.1 for i in range(30)],
+            "close": [100.5 + i * 0.1 for i in range(30)],
+            "volume": [1_000_000 + i for i in range(30)],
         })
 
         with patch("app.data_sources.auto_market_collector._kis_mode", return_value=None):
             with patch("app.data_sources.auto_market_collector._fetch_yfinance_intraday", return_value=mu_df):
-                result = collect_mu_data()
+                with patch("app.data_sources.auto_market_collector._fetch_yfinance_daily", return_value=mu_daily):
+                    result = collect_mu_data()
 
         assert result["df_3min"] is not None
         assert not result["df_3min"].empty

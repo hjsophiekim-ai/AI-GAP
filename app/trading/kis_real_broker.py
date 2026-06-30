@@ -84,7 +84,37 @@ class KisRealBroker(BrokerBase):
 
     def _get_order_limits(self) -> dict:
         """실계좌 주문 안전한도 읽기."""
-        return self._cfg.get_real_order_limits()
+        safety = getattr(self._cfg, "safety", {}) or {}
+        raw = getattr(self._cfg, "_raw", {}) or {}
+        raw_safety = raw.get("safety", {}) if isinstance(raw, dict) else {}
+        merged = {**raw_safety, **safety}
+        merged["_use_env_auto_reduce"] = bool(raw_safety)
+        if any(key in merged for key in ("max_order_amount", "max_daily_order_amount", "max_position_amount_per_symbol", "max_real_order_amount", "max_real_daily_budget")):
+            return self._normalize_order_limits(merged)
+        getter = getattr(self._cfg, "get_real_order_limits", None)
+        if callable(getter):
+            try:
+                limits = getter()
+                if isinstance(limits, dict):
+                    return self._normalize_order_limits(limits)
+            except Exception:
+                pass
+        return self._normalize_order_limits(merged)
+
+    def _normalize_order_limits(self, values: dict) -> dict:
+        def _num(*keys: str, default: float) -> float:
+            for key in keys:
+                value = values.get(key)
+                if isinstance(value, (int, float)):
+                    return float(value)
+            return float(default)
+
+        return {
+            "per_symbol": _num("max_position_amount_per_symbol", "max_order_amount", default=10_000_000),
+            "per_order": _num("max_order_amount", "max_real_order_amount", default=10_000_000),
+            "daily": _num("max_daily_order_amount", "max_real_daily_budget", default=30_000_000),
+            "auto_reduce": str(values.get("auto_reduce_order", values.get("auto_reduce", __import__("os").environ.get("AUTO_REDUCE_QUANTITY_ON_SAFETY_LIMIT", "false") if values.get("_use_env_auto_reduce") else "false"))).lower() in ("1", "true", "yes", "y"),
+        }
 
     def _check_order_limits(
         self,
@@ -103,6 +133,8 @@ class KisRealBroker(BrokerBase):
                 orderable_cash = self.kis.get_buyable_cash(symbol=symbol, price=int(price))
         except Exception:
             pass
+        if not isinstance(orderable_cash, (int, float)):
+            orderable_cash = 0.0
 
         if limits["per_symbol"] > 0 and order_amt > limits["per_symbol"]:
             msg = (
@@ -154,6 +186,8 @@ class KisRealBroker(BrokerBase):
                 orderable_cash = self.kis.get_buyable_cash(symbol=symbol, price=int(price))
         except Exception:
             pass
+        if not isinstance(orderable_cash, (int, float)):
+            orderable_cash = 0.0
 
         remaining_daily = max(0.0, limits["daily"] - self._daily_ordered_amount)
         candidates = [limits["per_order"], remaining_daily, limits["per_symbol"]]
@@ -273,6 +307,10 @@ class KisRealBroker(BrokerBase):
             quantity, price, symbol=symbol, allocated_budget=0.0,
         )
         if err_msg:
+            if err_type == "safety_per_order_limit_exceeded" and "safety rule" not in err_msg:
+                err_msg = "safety rule: " + err_msg
+            if err_type == "safety_daily_limit_exceeded":
+                err_msg = err_msg.replace("일일한도", "일일 한도")
             if limits.get("auto_reduce", True):
                 new_qty, reduce_reason = self._auto_reduce_quantity(quantity, price, symbol=symbol)
                 if new_qty < 1:

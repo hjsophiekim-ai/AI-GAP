@@ -95,7 +95,7 @@ def compute_hynix_tech_indicators(df_daily: pd.DataFrame) -> dict:
         "ma5_position_pct", "ma20_position_pct", "ma60_position_pct",
         "from_20d_high_pct", "from_20d_low_pct", "bollinger_pct",
         "prev_candle_type", "return_3d_pct", "return_5d_pct",
-        "return_10d_pct", "volume_change_pct",
+        "return_10d_pct", "volume_change_pct", "atr_14_pct",
     ]}
 
     if df_daily is None or len(df_daily) < 5:
@@ -117,6 +117,20 @@ def compute_hynix_tech_indicators(df_daily: pd.DataFrame) -> dict:
         rs    = gain / loss.replace(0.0, float("inf"))
         rsi   = (100 - 100 / (1 + rs)).iloc[-1]
         result["rsi_14"] = round(float(rsi), 2)
+
+    if len(df) >= 15:
+        prev_close_series = closes.shift(1)
+        true_range = pd.concat(
+            [
+                highs - lows,
+                (highs - prev_close_series).abs(),
+                (lows - prev_close_series).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr14 = float(true_range.rolling(14).mean().iloc[-1])
+        if current > 0 and atr14 > 0:
+            result["atr_14_pct"] = round(atr14 / current * 100, 4)
 
     # MACD (12, 26, 9)
     if len(df) >= 27:
@@ -200,6 +214,7 @@ def evaluate_swing_flag(
     nvda_return_pct: Optional[float] = None,
     qqq_return_pct: Optional[float] = None,
     usd_krw_change_pct: Optional[float] = None,
+    hynix_current_price: Optional[float] = None,
     hynix_prev_close: Optional[float] = None,
     prediction: Optional[dict] = None,
 ) -> dict:
@@ -258,6 +273,7 @@ def evaluate_swing_flag(
 
     # ── 가격 구간 계산 ────────────────────────────────────────────────────────
     prices = _compute_price_zones(
+        hynix_current_price=hynix_current_price,
         hynix_prev_close=hynix_prev_close,
         swing_score=swing_score,
         composite=composite,
@@ -479,11 +495,12 @@ def _compute_bottom_top_prob(
 # ── 가격 구간 계산 ────────────────────────────────────────────────────────────
 
 def _compute_price_zones(
-    hynix_prev_close: Optional[float],
-    swing_score: float,
-    composite: float,
-    ti: dict,
-    prediction: Optional[dict],
+    hynix_current_price: Optional[float] = None,
+    hynix_prev_close: Optional[float] = None,
+    swing_score: float = 50.0,
+    composite: float = 0.0,
+    ti: Optional[dict] = None,
+    prediction: Optional[dict] = None,
 ) -> dict:
     """목표가, 손절가, 매수/매도 구간 계산.
 
@@ -496,15 +513,20 @@ def _compute_price_zones(
         "target_price": None, "stop_loss_price": None,
     }
 
-    base = hynix_prev_close
+    ti = ti or {}
+    base = hynix_current_price
     if not base and prediction:
-        base = prediction.get("today_close_expected")
+        base = prediction.get("current_price") or prediction.get("base_price") or prediction.get("today_close_expected")
+    if not base:
+        base = hynix_prev_close
     if not base or base <= 0:
         return empty
 
     # 변동성 추정 (기술적 지표 기반)
+    atr_pct = ti.get("atr_14_pct")
     from_high = abs(ti.get("from_20d_high_pct") or 5.0)
-    volatility = max(from_high * 0.3, 3.0)  # 최소 3%
+    volatility = max(float(atr_pct) if atr_pct is not None else from_high * 0.3, 1.5)
+    volatility = min(volatility, 8.0)
 
     def _r(p: Optional[float]) -> Optional[int]:
         if p is None or p <= 0:
@@ -513,8 +535,8 @@ def _compute_price_zones(
         return int(round(p / unit) * unit)
 
     if composite >= 0:  # 매수 방향: target > base > stop_loss
-        risk_pct   = min(volatility * 0.8, 7.0)
-        reward_pct = risk_pct * 2.0
+        risk_pct   = min(max(volatility * 1.2, 1.5), 7.0)
+        reward_pct = risk_pct * 1.8
         buy_low    = base * (1 - volatility * 0.005)
         buy_high   = base * (1 + volatility * 0.003)
         target     = base * (1 + reward_pct / 100)   # base 위 → target > base
@@ -522,7 +544,7 @@ def _compute_price_zones(
         sell_low   = target * 0.99
         sell_high  = target * 1.01
     else:  # 매도 방향 (long-only 투자자 기준): target ≥ base > stop_loss
-        risk_pct   = min(volatility * 0.8, 7.0)
+        risk_pct   = min(max(volatility * 1.2, 1.5), 7.0)
         # 목표가: 현재가 부근 또는 소폭 위 (리바운드 시 청산 목표)
         reward_pct = risk_pct * 0.5
         sell_low   = base * (1 - volatility * 0.005)   # 매도 구간 하단 (현재가 아래)

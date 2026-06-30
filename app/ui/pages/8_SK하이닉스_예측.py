@@ -152,6 +152,13 @@ if refresh_data:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if auto_run:
+    for key in [
+        "engine_result", "auto_features", "hynix_pred", "hynix_swing",
+        "swing_explanation", "prediction_result", "target_price",
+        "stop_loss", "expected_open", "expected_high", "expected_low",
+        "expected_close", "previous_signal",
+    ]:
+        st.session_state.pop(key, None)
     if not _collector_ok:
         st.error(f"자동 수집 모듈 로드 실패: {_collector_err}")
     elif not _engine_ok:
@@ -237,6 +244,35 @@ if auto_run:
         diag = engine_result.get("diagnostics", {})
         hynix_data = market_data.get("hynix", {})
         index_data = market_data.get("index", {})
+
+        mu_diag_cols = st.columns(3)
+        for col, label, key in zip(
+            mu_diag_cols,
+            ["MU current", "MU 1m", "MU 3m"],
+            ["mu", "mu_1min", "mu_3min"],
+        ):
+            info = diag.get(key, {})
+            source = info.get("source") or "failed"
+            status_text = info.get("status") or ("success" if info.get("ok") else "failed")
+            with col:
+                st.caption(f"{label}: {source} {status_text}")
+
+        required_diag_sources = [
+            ("하이닉스 현재가", diag.get("hynix_current", {})),
+            ("하이닉스 20일 일봉", diag.get("hynix_daily", {})),
+            ("MU", diag.get("mu", {})),
+            ("NVDA", diag.get("nvda", {})),
+            ("QQQ", diag.get("qqq", {})),
+            ("SOXX/SOX", diag.get("sox", {})),
+            ("USD/KRW", diag.get("usdkrw", {})),
+        ]
+        source_cols = st.columns(4)
+        for idx, (label, info) in enumerate(required_diag_sources):
+            ok = bool(info.get("ok"))
+            source = info.get("source") or info.get("status") or "failed"
+            status_text = "성공" if ok else "실패"
+            with source_cols[idx % 4]:
+                st.caption(f"{label}: {source} {status_text}")
 
         _SOURCE_ICON = {
             "KIS": "🏦",
@@ -504,6 +540,14 @@ if pred:
 
     # 오늘 예상 OHLC
     st.markdown("#### 오늘 예상 흐름")
+    st.caption(
+        " | ".join([
+            f"current_price={_fmt(pred.get('current_price'))}",
+            f"base_source={pred.get('base_price_source') or 'unknown'}",
+            f"prev_close={_fmt(pred.get('hynix_prev_close'))}",
+            f"expected_return={pred.get('today_return_pct', 0):+.2f}%",
+        ])
+    )
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric("예상 시가", _fmt(pred.get("today_open_expected")))
@@ -560,12 +604,7 @@ if pred:
         df_1min = None
         if market_data.get("mu", {}).get("df_1min") is not None:
             df_1min = market_data["mu"]["df_1min"]
-        elif _MICRON_1MIN.exists():
-            try:
-                df_1min = pd.read_csv(_MICRON_1MIN, parse_dates=["datetime"])
-            except Exception:
-                pass
-        if df_1min is not None and not df_1min.empty:
+        if market_data.get("mu", {}).get("minute_1m_status") == "real candle success" and df_1min is not None and not df_1min.empty:
             if "datetime" in df_1min.columns:
                 st.line_chart(df_1min.set_index("datetime")[["close"]])
             else:
@@ -579,12 +618,7 @@ if pred:
         df_3min = None
         if market_data.get("mu", {}).get("df_3min") is not None:
             df_3min = market_data["mu"]["df_3min"]
-        elif _MICRON_3MIN.exists():
-            try:
-                df_3min = pd.read_csv(_MICRON_3MIN, parse_dates=["datetime"])
-            except Exception:
-                pass
-        if df_3min is not None and not df_3min.empty:
+        if market_data.get("mu", {}).get("minute_3m_status") == "real candle success" and df_3min is not None and not df_3min.empty:
             idx_col = "datetime" if "datetime" in df_3min.columns else df_3min.columns[0]
             st.line_chart(df_3min.set_index(idx_col)[["close"]])
         else:

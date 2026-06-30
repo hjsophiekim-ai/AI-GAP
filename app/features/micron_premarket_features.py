@@ -47,6 +47,11 @@ def compute_micron_features(
 
     if df_1min is None or df_1min.empty:
         return features
+    required = {"datetime", "open", "high", "low", "close", "volume"}
+    if not required.issubset(set(df_1min.columns)):
+        return features
+    if "session" not in df_1min.columns:
+        return features
 
     premarket = df_1min[df_1min["session"] == "premarket"].copy()
     regular   = df_1min[df_1min["session"] == "regular"].copy()
@@ -133,9 +138,10 @@ def compute_micron_features(
             )
 
     # ── 세션 강도 점수 ───────────────────────────────────────────────────────
-    features["micron_session_strength_score"] = _compute_strength_score(
-        features, premarket
-    )
+    if not premarket.empty:
+        features["micron_session_strength_score"] = _compute_strength_score(
+            features, premarket
+        )
 
     return features
 

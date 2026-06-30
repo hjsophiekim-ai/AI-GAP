@@ -138,8 +138,11 @@ class TestCollectIndexData:
             assert isinstance(result["sox_return"], float)
 
     def test_yfinance_failure_handled(self):
-        with patch("yfinance.download", side_effect=Exception("network error")):
-            result = collect_index_data()
+        with patch("app.data_sources.auto_market_collector._naver_global_quote",
+                   return_value={"status": "failed", "price": None, "return_pct": None, "source": "failed"}):
+            with patch("app.data_sources.auto_market_collector._fetch_global_quote_from_yfinance",
+                       return_value={"status": "failed", "price": None, "return_pct": None, "source": "yfinance"}):
+                result = collect_index_data()
         assert result["qqq_return"] is None
         assert result["error"] is not None
 

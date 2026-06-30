@@ -1,302 +1,354 @@
-"""
-hynix_forecast_engine.py — SK하이닉스 예측 파이프라인 + 데이터 수집률 게이트.
-
-데이터 품질 점수 기반으로 예측 실행 여부를 결정합니다:
-  - 70% 이상 : 정상 예측
-  - 40~70%  : 낮은 신뢰도 예측 (경고 표시)
-  - 40% 미만 : 예측 차단 (데이터 부족)
-
-신뢰도 게이트:
-  - confidence_score < 40 : 매수/매도 추천 대신 "데이터 부족/저신뢰" 표시
-
-실전 주문 기능과 절대 연결하지 않습니다.
-"""
+"""Forecast pipeline and data-quality gate for the SK Hynix tab."""
 
 from __future__ import annotations
 
 import logging
-import os
+import json
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-BLOCK_THRESHOLD   = 0.40  # 이하면 예측 차단
-LOW_CONF_THRESHOLD = 0.70  # 이하면 낮은 신뢰도 경고
-CONFIDENCE_GATE   = 40.0  # 이하면 매수/매도 추천 금지
+BLOCK_THRESHOLD = 0.40
+LOW_CONF_THRESHOLD = 0.70
+CONFIDENCE_GATE = 40.0
 
-# ── 디버그 로거 설정 ──────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent.parent.parent
+LOG_DIR = ROOT / "logs"
 
-_ROOT = Path(__file__).resolve().parent.parent.parent
-_LOG_DIR = _ROOT / "logs"
 
 def _get_debug_logger() -> logging.Logger:
-    """hynix_prediction_debug.log 파일 로거."""
     logger = logging.getLogger("hynix_prediction_debug")
     if not logger.handlers:
         try:
-            _LOG_DIR.mkdir(parents=True, exist_ok=True)
-            fh = logging.FileHandler(
-                _LOG_DIR / "hynix_prediction_debug.log",
-                encoding="utf-8",
-            )
-            fh.setFormatter(logging.Formatter(
-                "%(asctime)s [%(levelname)s] %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            ))
-            logger.addHandler(fh)
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(LOG_DIR / "hynix_prediction_debug.log", encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            logger.addHandler(handler)
             logger.setLevel(logging.DEBUG)
         except Exception:
             logger.addHandler(logging.NullHandler())
     return logger
 
 
-# ── 최소 예측 조건 검증 ───────────────────────────────────────────────────────
-
 def _check_minimum_conditions(auto_feat: dict) -> tuple[bool, str]:
-    """
-    예측에 필요한 최소 데이터 조건을 검증합니다.
+    """Validate required inputs before any forecast is created."""
+    predictor_kwargs = auto_feat.get("predictor_kwargs", {})
+    micron_features = auto_feat.get("micron_features", {})
 
-    조건:
-      1) SK하이닉스 전일 종가 필수
-      2) MU 프리마켓 또는 코스피랩 데이터 중 하나 이상 필수
-      3) 외부 지표 (SOX/NVDA/QQQ/USD·KRW) 중 2개 이상 필수
-    """
-    pf = auto_feat.get("predictor_kwargs", {})
-    mf = auto_feat.get("micron_features", {})
+    current_price = predictor_kwargs.get("hynix_current_price")
+    prev_close = predictor_kwargs.get("hynix_prev_close")
+    daily_count = auto_feat.get("hynix_daily_count")
 
-    # 조건 1: 하이닉스 전일 종가 OR 현재가 (한 가지 이상 필수)
-    prev_close    = pf.get("hynix_prev_close")
-    current_price = pf.get("hynix_current_price")
-    if not prev_close and not current_price:
-        return False, "SK하이닉스 전일 종가 및 현재가 모두 없음 — 예측 불가"
+    if "hynix_current_price" in predictor_kwargs and current_price is None:
+        return False, "SK Hynix current price missing; prediction blocked"
+    if prev_close is None:
+        return False, "SK하이닉스 전일 종가 missing; prediction blocked"
+    if daily_count is not None and int(daily_count) < 20:
+        return False, f"SK Hynix daily candles={daily_count}; at least 20 required"
 
-    # 조건 2: MU 또는 코스피랩
-    has_mu       = mf.get("micron_session_strength_score") is not None
-    has_kospilab = pf.get("kospilab_expected_return_pct") is not None
+    has_mu = micron_features.get("micron_session_strength_score") is not None
+    has_kospilab = predictor_kwargs.get("kospilab_expected_return_pct") is not None
     if not has_mu and not has_kospilab:
-        return False, "MU 프리마켓 데이터 및 코스피랩 데이터 모두 없음 — 예측 불가"
+        return False, "MU and 코스피랩 inputs are both missing; prediction blocked"
 
-    # 조건 3: 외부 지표 2개 이상
-    ext_vals = [
-        pf.get("sox_return_pct"),
-        pf.get("nvda_return_pct"),
-        pf.get("qqq_return_pct"),
-        pf.get("usd_krw_change_pct"),
+    external_values = [
+        predictor_kwargs.get("sox_return_pct"),
+        predictor_kwargs.get("nvda_return_pct"),
+        predictor_kwargs.get("qqq_return_pct"),
+        predictor_kwargs.get("usd_krw_change_pct"),
     ]
-    ext_count = sum(1 for v in ext_vals if v is not None)
-    if ext_count < 2:
-        return (
-            False,
-            f"외부 지표 {ext_count}개 수집 — 최소 2개 필요 "
-            "(SOX·NVDA·QQQ·USD/KRW 중 2개 이상)",
-        )
+    external_count = sum(1 for value in external_values if value is not None)
+    if external_count < 2:
+        return False, f"Only {external_count} 외부 지표 collected; at least 2 required"
 
     return True, "ok"
 
 
-# ── 예측 파이프라인 ───────────────────────────────────────────────────────────
-
 def run_forecast(market_data: dict) -> dict:
-    """
-    시장 데이터를 받아 전체 예측 파이프라인을 실행합니다.
-
-    Parameters
-    ----------
-    market_data : collect_all() 반환 dict
-
-    Returns
-    -------
-    dict
-        status         : "ok" | "low_confidence" | "blocked"
-        data_quality   : float (0~1)
-        confidence_blocked : bool — confidence_score < 40 시 True
-        message        : str  — 한글 상태 메시지
-        auto_features  : dict | None
-        prediction     : dict | None
-        swing          : dict | None
-        explanation    : str | None
-        errors         : list[str]
-        diagnostics    : dict — 각 소스별 수집 현황
-    """
+    """Build features, apply gates, and run price/swing forecasts."""
     log = _get_debug_logger()
-
-    result: dict = {
-        "status":            "blocked",
-        "data_quality":      0.0,
+    result = {
+        "status": "blocked",
+        "data_quality": 0.0,
         "confidence_blocked": False,
-        "message":           "데이터 수집 전",
-        "auto_features":     None,
-        "prediction":        None,
-        "swing":             None,
-        "explanation":       None,
-        "errors":            list(market_data.get("errors", [])),
-        "diagnostics":       _build_diagnostics(market_data),
+        "message": "data collection pending",
+        "auto_features": None,
+        "prediction": None,
+        "swing": None,
+        "explanation": None,
+        "errors": list(market_data.get("errors", [])),
+        "diagnostics": _build_diagnostics(market_data),
     }
 
-    log.info("=== 예측 파이프라인 시작 ===")
-    log.debug("market_data sources: mu=%s, nvda=%s, index=%s, hynix=%s, kospilab=%s",
-              market_data.get("mu", {}).get("source"),
-              market_data.get("nvda", {}).get("source"),
-              market_data.get("index", {}).get("source"),
-              market_data.get("hynix", {}).get("source"),
-              market_data.get("kospilab", {}).get("source_status"))
+    gate_ok, gate_msg = _check_market_data_gate(market_data)
+    if not gate_ok:
+        result["message"] = gate_msg
+        result["errors"].append(gate_msg)
+        _log_used_inputs(market_data, result)
+        return result
 
-    # ── 1. Auto feature 계산 ──────────────────────────────────────────────────
     try:
         from app.features.hynix_auto_features import build_auto_features
+
         auto_feat = build_auto_features(market_data)
         result["auto_features"] = auto_feat
-        dq = float(auto_feat.get("data_quality", 0.0))
-        result["data_quality"] = dq
-        log.info("데이터 품질 점수: %.2f (%.0f%%)", dq, dq * 100)
-    except Exception as e:
-        result["message"] = f"Feature 계산 실패: {e}"
-        result["errors"].append(str(e))
-        log.error("Feature 계산 실패: %s", e)
+        data_quality = float(auto_feat.get("data_quality", 0.0))
+        result["data_quality"] = data_quality
+    except Exception as exc:
+        result["message"] = f"Feature build failed: {exc}"
+        result["errors"].append(str(exc))
+        log.exception("feature build failed")
+        _log_used_inputs(market_data, result)
         return result
 
-    # ── 2. 최소 조건 검증 ──────────────────────────────────────────────────────
-    min_ok, min_msg = _check_minimum_conditions(auto_feat)
+    min_ok, min_msg = _check_minimum_conditions(result["auto_features"])
     if not min_ok:
-        result["status"] = "blocked"
-        result["message"] = f"최소 예측 조건 미충족: {min_msg}"
-        log.warning("최소 조건 미충족: %s", min_msg)
+        result["message"] = min_msg
+        log.warning("minimum conditions failed: %s", min_msg)
+        result["errors"].append(min_msg)
+        _log_used_inputs(market_data, result)
         return result
 
-    # ── 3. 수집률 게이트 ──────────────────────────────────────────────────────
-    if dq < BLOCK_THRESHOLD:
-        result["status"] = "blocked"
+    if result["data_quality"] < BLOCK_THRESHOLD:
         result["message"] = (
-            f"데이터 수집률 {dq * 100:.0f}% — 신뢰도 부족으로 예측을 생략합니다. "
-            f"(정상 예측 최소 기준: {BLOCK_THRESHOLD * 100:.0f}%)\n"
-            "MU 프리마켓 또는 SK하이닉스 일봉 데이터를 확인하세요."
+            f"Data quality {result['data_quality'] * 100:.0f}% is below "
+            f"{BLOCK_THRESHOLD * 100:.0f}%; prediction blocked"
         )
-        log.warning("수집률 게이트 차단: %.0f%%", dq * 100)
+        result["errors"].append(result["message"])
+        _log_used_inputs(market_data, result)
         return result
 
-    # ── 4. 가격 예측 ─────────────────────────────────────────────────────────
     try:
         from app.models.hynix_predictor import predict_hynix
-        pred = predict_hynix(
-            micron_features=auto_feat["micron_features"],
-            **auto_feat["predictor_kwargs"],
+
+        pk = result["auto_features"]["predictor_kwargs"]
+        log.warning(
+            "[PREDICT_BASE] base_price=%s current_price=%s prev_close=%s",
+            pk.get("hynix_current_price"),
+            pk.get("hynix_current_price"),
+            pk.get("hynix_prev_close"),
         )
-        result["prediction"] = pred
-        log.info("가격 예측 완료: 오늘등락률=%.2f%%, 신뢰도=%.1f",
-                 pred.get("today_return_pct", 0), pred.get("confidence_score", 0))
-    except Exception as e:
-        result["message"] = f"예측 연산 실패: {e}"
-        result["errors"].append(str(e))
-        result["status"] = "blocked"
-        log.error("가격 예측 실패: %s", e)
+        prediction = predict_hynix(
+            micron_features=result["auto_features"]["micron_features"],
+            **result["auto_features"]["predictor_kwargs"],
+        )
+        result["prediction"] = prediction
+        abnormal = _analyze_prediction_gap(prediction, pk.get("hynix_current_price"))
+        if abnormal:
+            result["diagnostics"]["prediction_gap_analysis"] = abnormal
+            result["errors"].append(abnormal["message"])
+            result["message"] = abnormal["message"]
+            log.warning("prediction gap analysis: %s", abnormal)
+            _log_used_inputs(market_data, result)
+            return result
+    except Exception as exc:
+        result["message"] = f"Prediction failed: {exc}"
+        result["errors"].append(str(exc))
+        log.exception("prediction failed")
+        _log_used_inputs(market_data, result)
         return result
 
-    # ── 5. 스윙 플래그 ────────────────────────────────────────────────────────
     try:
         from app.models.hynix_swing_flag import evaluate_swing_flag
+
         swing = evaluate_swing_flag(
-            micron_features=auto_feat["micron_features"],
-            prediction=pred,
-            **auto_feat["swing_kwargs"],
+            micron_features=result["auto_features"]["micron_features"],
+            prediction=result["prediction"],
+            **result["auto_features"]["swing_kwargs"],
         )
         result["swing"] = swing
-        log.info("스윙 플래그: %s (score=%.1f, confidence=%.1f)",
-                 swing.get("swing_flag"), swing.get("swing_score", 0),
-                 swing.get("confidence_score", 0))
+        contradiction = _find_signal_contradiction(swing)
+        if contradiction:
+            swing["action_text"] = None
+            swing["buy_timing_text"] = None
+            swing["sell_timing_text"] = None
+            swing["signal_blocked"] = True
+            swing["signal_block_reason"] = contradiction
+            result["errors"].append(contradiction)
 
-        # 가격 구간 논리 검증
-        try:
-            from app.data.market_data_validator import validate_swing_result
-            zone_ok, zone_msg = validate_swing_result(swing)
-            if not zone_ok:
-                result["errors"].append(f"가격 구간 오류: {zone_msg}")
-                log.error("가격 구간 논리 오류: %s", zone_msg)
-        except ImportError:
-            pass
-    except Exception as e:
-        result["errors"].append(f"스윙 플래그 오류: {e}")
-        log.error("스윙 플래그 실패: %s", e)
+        from app.data.market_data_validator import validate_prediction_prices, validate_swing_result
 
-    # ── 6. 신뢰도 게이트 (confidence < 40 → 추천 차단) ──────────────────────
-    swing_cf = (result["swing"] or {}).get("confidence_score", 0.0)
-    if swing_cf < CONFIDENCE_GATE:
+        zone_ok, zone_msg = validate_swing_result(swing)
+        if not zone_ok:
+            result["errors"].append(f"Invalid price zones: {zone_msg}")
+        current_price = result["auto_features"]["predictor_kwargs"].get("hynix_current_price")
+        validate_prediction_prices({**prediction, **{
+            "target_price": swing.get("target_price"),
+            "stop_loss_price": swing.get("stop_loss_price"),
+        }}, current_price)
+    except Exception as exc:
+        result["errors"].append(f"Swing flag failed: {exc}")
+        result["message"] = f"Price validation failed: {exc}"
+        log.exception("swing flag failed")
+        _log_used_inputs(market_data, result)
+        return result
+
+    swing_confidence = (result["swing"] or {}).get("confidence_score", 0.0)
+    if swing_confidence < CONFIDENCE_GATE:
         result["confidence_blocked"] = True
-        log.warning("신뢰도 게이트 차단: confidence=%.1f < %.0f", swing_cf, CONFIDENCE_GATE)
 
-    # ── 7. 한글 설명 ──────────────────────────────────────────────────────────
     try:
         from app.models.hynix_swing_explainer import generate_swing_explanation
-        if result["swing"]:
-            expl = generate_swing_explanation(
-                swing_result=result["swing"],
-                micron_features=auto_feat["micron_features"],
-                tech_indicators=auto_feat.get("tech_indicators"),
-                kospilab_return=auto_feat.get("kospilab_return"),
-            )
-            result["explanation"] = expl
-    except Exception as e:
-        result["errors"].append(f"설명 생성 오류: {e}")
-        log.warning("설명 생성 실패: %s", e)
 
-    # ── 8. 최종 상태 결정 ─────────────────────────────────────────────────────
-    if dq < LOW_CONF_THRESHOLD:
+        if result["swing"]:
+            result["explanation"] = generate_swing_explanation(
+                swing_result=result["swing"],
+                micron_features=result["auto_features"]["micron_features"],
+                tech_indicators=result["auto_features"].get("tech_indicators"),
+                kospilab_return=result["auto_features"].get("kospilab_return"),
+            )
+    except Exception as exc:
+        result["errors"].append(f"Explanation failed: {exc}")
+
+    if result["data_quality"] < LOW_CONF_THRESHOLD:
         result["status"] = "low_confidence"
-        result["message"] = (
-            f"데이터 수집률 {dq * 100:.0f}% — 일부 데이터가 누락되어 예측 신뢰도가 낮습니다. "
-            "참고용으로만 활용하세요."
-        )
+        result["message"] = f"Data quality {result['data_quality'] * 100:.0f}%; low-confidence forecast"
     else:
         result["status"] = "ok"
-        result["message"] = f"데이터 수집률 {dq * 100:.0f}% — 정상 예측"
+        result["message"] = f"Data quality {result['data_quality'] * 100:.0f}%; forecast complete"
 
-    log.info("예측 완료: status=%s, confidence_blocked=%s",
-             result["status"], result["confidence_blocked"])
-    log.info("=== 예측 파이프라인 종료 ===")
+    _log_used_inputs(market_data, result)
     return result
 
 
-# ── 진단 정보 빌더 ────────────────────────────────────────────────────────────
-
 def _build_diagnostics(market_data: dict) -> dict:
-    """각 데이터 소스별 수집 현황 요약."""
-    mu     = market_data.get("mu", {})
-    nvda   = market_data.get("nvda", {})
-    idx    = market_data.get("index", {})
-    hynix  = market_data.get("hynix", {})
-    klab   = market_data.get("kospilab", {})
+    mu = market_data.get("mu", {})
+    nvda = market_data.get("nvda", {})
+    index = market_data.get("index", {})
+    hynix = market_data.get("hynix", {})
+    kospilab = market_data.get("kospilab", {})
 
-    mu_ok      = mu.get("source") is not None and mu.get("current_price") is not None
-    nvda_ok    = nvda.get("source") is not None and nvda.get("current_price") is not None
-    sox_ok     = idx.get("sox_return") is not None
-    qqq_ok     = idx.get("qqq_return") is not None
-    usdkrw_ok  = idx.get("usdkrw_change") is not None
-    hynix_ok   = hynix.get("df_daily") is not None and hynix.get("prev_close") is not None
-    klab_ok    = klab.get("source_status") == "success" and klab.get("hynix_reference_return") is not None
+    df_daily = hynix.get("df_daily")
+    daily_count = 0 if df_daily is None else len(df_daily)
+    source_detail = hynix.get("source_detail", {})
+    index_sources = index.get("source_detail", {})
 
     return {
-        "mu":      {"ok": mu_ok,     "source": mu.get("source"), "error": mu.get("error")},
-        "nvda":    {"ok": nvda_ok,   "source": nvda.get("source"), "error": nvda.get("error")},
-        "sox":     {"ok": sox_ok,    "source": idx.get("source"), "value": idx.get("sox_return")},
-        "qqq":     {"ok": qqq_ok,    "source": idx.get("source"), "value": idx.get("qqq_return")},
-        "usdkrw":  {"ok": usdkrw_ok, "source": idx.get("source"), "value": idx.get("usdkrw_change")},
-        "hynix":   {"ok": hynix_ok,  "source": hynix.get("source"), "error": hynix.get("error"),
-                    "prev_close": hynix.get("prev_close")},
-        "kospilab": {"ok": klab_ok,  "status": klab.get("source_status"),
-                     "error": klab.get("error_message")},
+        "hynix_current": {
+            "ok": hynix.get("current_price") is not None,
+            "source": source_detail.get("current_price") or hynix.get("source"),
+            "value": hynix.get("current_price"),
+            "error": hynix.get("error"),
+        },
+        "hynix_daily": {
+            "ok": daily_count >= 20 and hynix.get("prev_close") is not None,
+            "source": source_detail.get("daily_ohlcv") or hynix.get("source"),
+            "count": daily_count,
+            "prev_close": hynix.get("prev_close"),
+            "error": hynix.get("error"),
+        },
+        "hynix": {
+            "ok": daily_count >= 20 and hynix.get("prev_close") is not None,
+            "source": hynix.get("source"),
+            "prev_close": hynix.get("prev_close"),
+            "error": hynix.get("error"),
+        },
+        "mu": {"ok": mu.get("current_price") is not None, "source": mu.get("source"), "status": mu.get("current_price_status"), "error": mu.get("error")},
+        "mu_1min": {"ok": mu.get("df_1min") is not None, "source": mu.get("source"), "status": mu.get("minute_1m_status"), "error": mu.get("minute_error")},
+        "mu_3min": {"ok": mu.get("df_3min") is not None, "source": mu.get("source"), "status": mu.get("minute_3m_status"), "error": mu.get("minute_error")},
+        "mu_daily": {"ok": mu.get("df_daily") is not None, "source": mu.get("source"), "status": mu.get("daily_status"), "error": mu.get("minute_error")},
+        "nvda": {"ok": nvda.get("current_price") is not None, "source": nvda.get("source"), "error": nvda.get("error")},
+        "sox": {"ok": index.get("sox_return") is not None, "source": index_sources.get("SOXX") or index.get("source"), "value": index.get("sox_return")},
+        "qqq": {"ok": index.get("qqq_return") is not None, "source": index_sources.get("NASDAQ_FUTURES") or index_sources.get("QQQ") or index.get("source"), "value": index.get("qqq_return")},
+        "usdkrw": {"ok": index.get("usdkrw_change") is not None, "source": index_sources.get("USDKRW") or index.get("source"), "value": index.get("usdkrw_change")},
+        "kospilab": {
+            "ok": kospilab.get("source_status") == "success" and kospilab.get("hynix_reference_return") is not None,
+            "status": kospilab.get("source_status"),
+            "error": kospilab.get("error_message"),
+        },
     }
 
 
-# ── 레이블 ────────────────────────────────────────────────────────────────────
+def _check_market_data_gate(market_data: dict) -> tuple[bool, str]:
+    hynix = market_data.get("hynix", {})
+    identity = hynix.get("stock_identity", {})
+    if identity and not identity.get("ok"):
+        return False, f"Stock identity validation failed: {identity.get('message')}"
+    price_validation = hynix.get("price_validation")
+    if price_validation and not price_validation.get("ok"):
+        return False, f"SK Hynix current price validation failed: {price_validation.get('message')}"
+
+    mu = market_data.get("mu", {})
+    if mu.get("df_1min") is None:
+        return False, "MU 1-minute candles missing; prediction unavailable"
+    if mu.get("df_3min") is None:
+        return False, "MU 3-minute candles missing; prediction unavailable"
+    if mu.get("df_daily") is None:
+        return False, "MU daily candles missing; prediction unavailable"
+
+    index = market_data.get("index", {})
+    missing = []
+    if index.get("sox_return") is None:
+        missing.append("SOX")
+    if index.get("qqq_return") is None:
+        missing.append("Nasdaq futures")
+    if index.get("usdkrw_change") is None:
+        missing.append("USD/KRW")
+    if missing:
+        return False, "Required overseas market data missing: " + ", ".join(missing)
+    return True, "ok"
+
+
+def _find_signal_contradiction(swing: dict) -> str | None:
+    score = float(swing.get("swing_score") or 50.0)
+    flag = str(swing.get("swing_flag") or "")
+    bullish = {"STRONG_BUY", "BUY", "WAIT_BUY"}
+    bearish = {"TAKE_PROFIT", "SELL", "STRONG_SELL"}
+    if score >= 55 and flag in bearish:
+        return f"Swing Score {score:.1f} is bullish but signal is {flag}; trade signal blocked"
+    if score <= 45 and flag in bullish:
+        return f"Swing Score {score:.1f} is bearish but signal is {flag}; trade signal blocked"
+    return None
+
+
+def _analyze_prediction_gap(prediction: dict, current_price: float | None) -> dict | None:
+    if not current_price:
+        return {"message": "Prediction gap analysis failed: current price missing", "cause": "missing_current_price"}
+    expected = prediction.get("today_close_expected")
+    if expected is None:
+        return None
+    gap_pct = (float(expected) / float(current_price) - 1.0) * 100
+    if abs(gap_pct) <= 15.0:
+        return None
+    causes = []
+    if prediction.get("base_price_source") != "current_price":
+        causes.append("prediction was not anchored to current_price")
+    if prediction.get("current_price") != current_price:
+        causes.append("current_price mismatch between input and prediction")
+    if not causes:
+        causes.append("return model produced an abnormal move")
+    return {
+        "message": f"Prediction unavailable: expected price differs from current price by {gap_pct:.2f}%",
+        "gap_pct": round(gap_pct, 4),
+        "current_price": current_price,
+        "expected_price": expected,
+        "cause": "; ".join(causes),
+    }
+
+
+def _log_used_inputs(market_data: dict, result: dict) -> None:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "logged_at": datetime.now().isoformat(),
+            "status": result.get("status"),
+            "message": result.get("message"),
+            "market_data_collected_at": market_data.get("collected_at"),
+            "diagnostics": result.get("diagnostics"),
+            "auto_features": result.get("auto_features"),
+            "prediction": result.get("prediction"),
+            "swing": result.get("swing"),
+        }
+        with (LOG_DIR / "hynix_prediction_inputs.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        logging.getLogger("hynix_prediction_debug").exception("used input log failed")
+
+
+def _filter_kwargs(kwargs: dict, blocked_keys: set[str]) -> dict:
+    return {key: value for key, value in kwargs.items() if key not in blocked_keys}
+
 
 def collection_rate_label(data_quality: float) -> tuple[str, str]:
-    """
-    데이터 품질 점수에서 (레이블, 색상) 반환.
-
-    Returns
-    -------
-    tuple[str, str]
-        label : "정상" | "낮은 신뢰도" | "수집 부족"
-        color : CSS 색상 문자열
-    """
     if data_quality >= LOW_CONF_THRESHOLD:
         return "정상", "#2ecc71"
     if data_quality >= BLOCK_THRESHOLD:

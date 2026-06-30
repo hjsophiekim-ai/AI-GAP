@@ -26,6 +26,19 @@ def _make_hynix_df(n: int = 25, close: float = 180_000) -> pd.DataFrame:
 # ── collect_hynix_daily fallback 순서 ────────────────────────────────────────
 
 class TestCollectHynixDailyFallback:
+    @pytest.fixture(autouse=True)
+    def _valid_current_price_gate(self):
+        detail = {
+            "source_prices": {"KIS": 180_000.0, "naver": 180_100.0, "yfinance": 179_900.0},
+            "selected_source": "KIS",
+            "selected_price": 180_000.0,
+            "max_diff_pct": 0.1112,
+        }
+        with patch(
+            "app.data_sources.auto_market_collector.validate_hynix_current_sources",
+            return_value=(True, "ok", detail),
+        ):
+            yield
 
     def test_kis_success_returns_kis_source(self):
         from app.data_sources.auto_market_collector import collect_hynix_daily
@@ -149,6 +162,13 @@ class TestCollectHynixDailyFallback:
 # ── collect_index_data 개별 티커 방식 ────────────────────────────────────────
 
 class TestCollectIndexFallback:
+    @pytest.fixture(autouse=True)
+    def _disable_naver_quote(self):
+        with patch(
+            "app.data_sources.auto_market_collector._naver_global_quote",
+            return_value={"status": "failed", "price": None, "return_pct": None, "source": "naver", "error": "mock"},
+        ):
+            yield
 
     def test_all_none_when_yfinance_fails(self):
         from app.data_sources.auto_market_collector import collect_index_data

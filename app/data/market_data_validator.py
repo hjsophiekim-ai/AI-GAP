@@ -10,6 +10,10 @@ from __future__ import annotations
 from typing import Optional
 
 
+class DataValidationError(ValueError):
+    """Raised when market or prediction data fails safety validation."""
+
+
 # ── 유효 가격 범위 상수 ───────────────────────────────────────────────────────
 
 MU_PRICE_MIN: float = 20.0        # USD
@@ -17,7 +21,9 @@ MU_PRICE_MAX: float = 500.0       # USD — 이 이상이면 단위 오류 의�
 MU_PRICE_HARD_MAX: float = 1000.0  # 이 이상이면 즉시 무효
 
 HYNIX_PRICE_MIN: int = 50_000     # KRW
-HYNIX_PRICE_MAX: int = 1_000_000  # KRW
+HYNIX_PRICE_MAX: int = 5_000_000  # KRW
+HYNIX_CODE: str = "000660"
+HYNIX_NAME: str = "SK하이닉스"
 
 
 # ── MU 가격 검증 ─────────────────────────────────────────────────────────────
@@ -107,6 +113,69 @@ def validate_hynix_price(price: Optional[float]) -> tuple[bool, str]:
     return True, "ok"
 
 
+def validate_stock_identity(code: object, name: object) -> tuple[bool, str]:
+    """Validate that the selected stock is SK Hynix (000660)."""
+    normalized_code = str(code or "").strip().zfill(6)
+    normalized_name = str(name or "").strip().replace(" ", "")
+    if normalized_code != HYNIX_CODE:
+        return False, f"stock code mismatch: expected {HYNIX_CODE}, got {normalized_code}"
+    if normalized_name not in {"SK하이닉스", "에스케이하이닉스"}:
+        return False, f"stock name mismatch: expected {HYNIX_NAME}, got {name}"
+    return True, "ok"
+
+
+def validate_hynix_current_sources(source_prices: dict, tolerance_pct: float = 1.0) -> tuple[bool, str, dict]:
+    """Validate KIS, Naver and Yahoo current prices before forecasting.
+
+    At least two valid sources are required. The selected anchor follows the
+    requested priority: KIS -> Naver -> Yahoo. If all available valid sources
+    differ by >= tolerance, the caller must block prediction.
+    """
+    required = ["KIS", "naver", "yfinance"]
+    cleaned: dict[str, float] = {}
+    missing: list[str] = []
+    invalid: dict[str, str] = {}
+    for source in required:
+        price = source_prices.get(source)
+        ok, msg = validate_hynix_price(price)
+        if not ok:
+            missing.append(source)
+            invalid[source] = msg
+            continue
+        cleaned[source] = float(price)
+
+    if len(cleaned) < 2:
+        return False, f"fewer than 2 valid current price sources: {invalid}", {
+            "source_prices": source_prices,
+            "selected_source": None,
+            "selected_price": None,
+            "max_diff_pct": None,
+            "missing_sources": missing,
+        }
+
+    values = list(cleaned.values())
+    low = min(values)
+    high = max(values)
+    max_diff_pct = (high / low - 1.0) * 100 if low > 0 else 100.0
+    if max_diff_pct >= tolerance_pct:
+        return False, f"current price source spread {max_diff_pct:.2f}% >= {tolerance_pct:.2f}%", {
+            "source_prices": cleaned,
+            "selected_source": None,
+            "selected_price": None,
+            "max_diff_pct": round(max_diff_pct, 4),
+            "missing_sources": missing,
+        }
+
+    selected_source = next(source for source in required if cleaned.get(source) is not None)
+    return True, "ok", {
+        "source_prices": cleaned,
+        "selected_source": selected_source,
+        "selected_price": cleaned[selected_source],
+        "max_diff_pct": round(max_diff_pct, 4),
+        "missing_sources": missing,
+    }
+
+
 def validate_hynix_dataframe(df) -> tuple[bool, str, object]:
     """
     SK하이닉스 일봉 DataFrame 검증.
@@ -175,3 +244,40 @@ def validate_swing_result(swing: dict) -> tuple[bool, str]:
         swing.get("stop_loss_price"),
     )
     return ok, msg
+
+
+def validate_prediction_prices(prediction: dict, current_price: Optional[float]) -> tuple[bool, str]:
+    """Validate final displayed SK Hynix prediction prices against current_price."""
+    if current_price is None or current_price <= 0:
+        raise DataValidationError("현재가 없음")
+
+    intraday_fields = [
+        "today_open_expected",
+        "today_high_expected",
+        "today_low_expected",
+        "today_close_expected",
+        "target_price",
+        "stop_loss_price",
+    ]
+    for field in intraday_fields:
+        value = prediction.get(field)
+        if value is None:
+            continue
+        ratio = float(value) / float(current_price)
+        if ratio > 1.15 or ratio < 0.85:
+            raise DataValidationError(
+                f"{field}가 현재가 대비 ±15%를 초과합니다. 기준가격 오류 가능성 "
+                f"(current_price={current_price:,.0f}, value={float(value):,.0f})"
+            )
+
+    for field in ["two_week_high_price", "two_week_low_price"]:
+        value = prediction.get(field)
+        if value is None:
+            continue
+        ratio = float(value) / float(current_price)
+        if ratio > 1.40 or ratio < 0.60:
+            return False, (
+                f"{field}가 현재가 대비 ±40%를 초과합니다 "
+                f"(current_price={current_price:,.0f}, value={float(value):,.0f})"
+            )
+    return True, "ok"
